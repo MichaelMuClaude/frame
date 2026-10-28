@@ -39,6 +39,7 @@ enum Undo {
 enum Pick {
     MoveTo(PathBuf),
     AddSource,
+    Exclude,
 }
 
 struct Config {
@@ -83,7 +84,7 @@ struct App {
 
 impl App {
     fn new(ctx: &egui::Context, cfg: Config) -> Self {
-        let scan_rx = loader::spawn_scan(ctx.clone(), cfg.dirs.clone());
+        let scan_rx = loader::spawn_scan(ctx.clone(), cfg.dirs.clone(), cfg.settings.exclude.clone());
         let (job_tx, res_rx) = loader::spawn_workers(ctx.clone());
         Self {
             queue: Vec::new(),
@@ -182,6 +183,12 @@ impl App {
                             if !self.dirs.contains(&dir) {
                                 self.dirs.push(dir);
                                 self.save_dirs(ctx);
+                            }
+                        }
+                        Pick::Exclude => {
+                            if !self.settings.exclude.contains(&dir) {
+                                self.settings.exclude.push(dir);
+                                self.save_exclude(ctx);
                             }
                         }
                     }
@@ -411,10 +418,16 @@ impl App {
             return;
         }
         let (tx, rx) = mpsc::channel();
-        let start = self.settings.recent.first().cloned().or_else(home_dir);
+        let start = match kind {
+            // Folders to leave out sit inside the photo folders, so start there.
+            Pick::Exclude => self.dirs.first().cloned(),
+            _ => self.settings.recent.first().cloned(),
+        }
+        .or_else(home_dir);
         let title = match kind {
             Pick::MoveTo(_) => "Move photo to...",
             Pick::AddSource => "Add a photo folder",
+            Pick::Exclude => "Exclude a folder",
         };
         self.pick = Some((kind, rx));
         let ctx = ctx.clone();
@@ -429,8 +442,13 @@ impl App {
     }
 
     fn rescan(&mut self, ctx: &egui::Context) {
-        self.scan_rx = loader::spawn_scan(ctx.clone(), self.dirs.clone());
+        self.scan_rx = loader::spawn_scan(ctx.clone(), self.dirs.clone(), self.settings.exclude.clone());
         self.scanned = false;
+    }
+
+    fn save_exclude(&mut self, ctx: &egui::Context) {
+        settings::save(&self.settings);
+        self.rescan(ctx);
     }
 
     fn save_dirs(&mut self, ctx: &egui::Context) {
@@ -513,12 +531,14 @@ impl App {
         }
         let builder = egui::ViewportBuilder::default()
             .with_title("Frame settings")
-            .with_inner_size([540.0, 380.0])
-            .with_min_inner_size([380.0, 260.0]);
+            .with_inner_size([540.0, 500.0])
+            .with_min_inner_size([380.0, 320.0]);
         let dirs = self.dirs.clone();
+        let exclude = self.settings.exclude.clone();
         let mut secs = self.interval.as_secs();
         let mut fit = self.fit;
         let (mut close, mut add, mut remove) = (false, false, None::<usize>);
+        let (mut add_exclude, mut unexclude) = (false, None::<usize>);
         ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("frame-settings"), builder, |ctx, _| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 ui.heading("Photo folders");
@@ -535,6 +555,25 @@ impl App {
                 ui.add_space(4.0);
                 if ui.button("Add folder...").clicked() {
                     add = true;
+                }
+                ui.separator();
+                ui.heading("Excluded folders");
+                ui.label("Photos in these folders, and in the folders below them, are never shown.");
+                ui.add_space(6.0);
+                if exclude.is_empty() {
+                    ui.weak("None");
+                }
+                for (i, d) in exclude.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        if ui.button("Include again").clicked() {
+                            unexclude = Some(i);
+                        }
+                        ui.label(d.display().to_string());
+                    });
+                }
+                ui.add_space(4.0);
+                if ui.button("Exclude folder...").clicked() {
+                    add_exclude = true;
                 }
                 ui.separator();
                 ui.horizontal(|ui| {
@@ -562,6 +601,15 @@ impl App {
         }
         if add {
             self.start_pick(ctx, Pick::AddSource);
+        }
+        if let Some(i) = unexclude {
+            if i < self.settings.exclude.len() {
+                self.settings.exclude.remove(i);
+                self.save_exclude(ctx);
+            }
+        }
+        if add_exclude {
+            self.start_pick(ctx, Pick::Exclude);
         }
         if secs != self.interval.as_secs() {
             self.interval = Duration::from_secs(secs.max(1));

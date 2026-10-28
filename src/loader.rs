@@ -18,13 +18,14 @@ pub enum Loaded {
     Err(PathBuf, String),
 }
 
-/// Scans the folders on a background thread and sends back every photo found.
-pub fn spawn_scan(ctx: egui::Context, dirs: Vec<PathBuf>) -> Receiver<Vec<PathBuf>> {
+/// Scans the folders on a background thread and sends back every photo found,
+/// leaving out anything inside an `exclude` folder.
+pub fn spawn_scan(ctx: egui::Context, dirs: Vec<PathBuf>, exclude: Vec<PathBuf>) -> Receiver<Vec<PathBuf>> {
     let (scan_tx, scan_rx) = mpsc::channel();
     thread::spawn(move || {
         let mut found = Vec::new();
         for dir in dirs {
-            scan(&dir, &mut found);
+            scan(&dir, &exclude, &mut found);
         }
         let _ = scan_tx.send(found);
         ctx.request_repaint();
@@ -63,11 +64,14 @@ fn is_hidden(name: &std::ffi::OsStr) -> bool {
     name.to_string_lossy().starts_with('.')
 }
 
-fn scan(dir: &Path, out: &mut Vec<PathBuf>) {
+fn scan(dir: &Path, exclude: &[PathBuf], out: &mut Vec<PathBuf>) {
     let walker = walkdir::WalkDir::new(dir)
         .into_iter()
-        // Skip hidden folders such as .dropbox.cache and .thumbnails (but not the root itself).
-        .filter_entry(|e| e.depth() == 0 || !is_hidden(e.file_name()));
+        // Skip hidden folders such as .dropbox.cache and .thumbnails (but not the root itself),
+        // and excluded folders together with everything below them.
+        .filter_entry(|e| {
+            (e.depth() == 0 || !is_hidden(e.file_name())) && !exclude.iter().any(|x| e.path().starts_with(x))
+        });
     for entry in walker.flatten() {
         if !entry.file_type().is_file() {
             continue;
@@ -129,4 +133,33 @@ fn decode_heif(path: &Path) -> Result<image::DynamicImage, String> {
     }
     let rgba = image::RgbaImage::from_raw(w as u32, h as u32, buf).ok_or("bad buffer size")?;
     Ok(image::DynamicImage::ImageRgba8(rgba))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scan_skips_excluded_folders_and_everything_below() {
+        let root = std::env::temp_dir().join(format!("frame-scan-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for sub in ["keep", "skip", "skip/deep", "keep/skipper"] {
+            std::fs::create_dir_all(root.join(sub)).unwrap();
+        }
+        for f in ["a.jpg", "keep/b.jpg", "skip/c.jpg", "skip/deep/d.heic", "keep/skipper/e.png"] {
+            std::fs::write(root.join(f), b"").unwrap();
+        }
+
+        let mut found = Vec::new();
+        scan(&root, &[root.join("skip")], &mut found);
+        let mut names: Vec<_> = found.iter().map(|p| p.strip_prefix(&root).unwrap().to_owned()).collect();
+        names.sort();
+        // "keep/skipper" shares a name prefix with "skip" but is a different folder: it must stay.
+        assert_eq!(names, [PathBuf::from("a.jpg"), "keep/b.jpg".into(), "keep/skipper/e.png".into()]);
+
+        let mut all = Vec::new();
+        scan(&root, &[], &mut all);
+        assert_eq!(all.len(), 5);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

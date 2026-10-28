@@ -1,5 +1,5 @@
 //! Small persistent settings file (`~/.config/frame/settings.txt`, `%APPDATA%\frame\settings.txt` on Windows).
-//! Plain `key=value` lines; `dir` and `recent` may repeat.
+//! Plain `key=value` lines; `dir`, `exclude` and `recent` may repeat.
 
 use std::path::PathBuf;
 
@@ -7,6 +7,8 @@ use std::path::PathBuf;
 pub struct Settings {
     /// Folders the photos are picked from.
     pub dirs: Vec<PathBuf>,
+    /// Folders (inside the photo folders) whose photos are never shown.
+    pub exclude: Vec<PathBuf>,
     /// Folders photos were recently moved to, most recent first.
     pub recent: Vec<PathBuf>,
     pub interval: u64,
@@ -15,7 +17,7 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { dirs: Vec::new(), recent: Vec::new(), interval: 10, fit: true }
+        Self { dirs: Vec::new(), exclude: Vec::new(), recent: Vec::new(), interval: 10, fit: true }
     }
 }
 
@@ -38,6 +40,7 @@ pub fn load() -> Settings {
         let Some((key, value)) = line.split_once('=') else { continue };
         match key.trim() {
             "dir" => st.dirs.push(PathBuf::from(value)),
+            "exclude" => st.exclude.push(PathBuf::from(value)),
             "recent" => st.recent.push(PathBuf::from(value)),
             "interval" => {
                 if let Ok(n) = value.trim().parse::<u64>() {
@@ -56,6 +59,9 @@ pub fn save(st: &Settings) {
     let mut out = String::new();
     for d in &st.dirs {
         out.push_str(&format!("dir={}\n", d.display()));
+    }
+    for d in &st.exclude {
+        out.push_str(&format!("exclude={}\n", d.display()));
     }
     for d in &st.recent {
         out.push_str(&format!("recent={}\n", d.display()));

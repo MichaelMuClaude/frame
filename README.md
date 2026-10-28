@@ -19,8 +19,9 @@ TIFF and iPhone HEIC/HEIF photos.
   - For an iPhone Live Photo (a `.HEIC` or `.JPG` with a same-named `.MOV` next to it), Trash and Move take the video along and Undo brings both back. Only the still photo is shown; videos are not played.
   - **Previous** (left edge): goes back to the photo you just saw.
 - Drag the photo to move the window, drag the wooden edges or corners to resize it.
-- Right-click for next/previous, pause, quit, and **Settings...** (photo folders, interval,
-  whether the frame follows each photo's shape). Settings are saved to
+- Right-click for next/previous, pause, quit, and **Settings...** (photo folders, folders to
+  exclude, interval, whether the frame follows each photo's shape). An excluded folder and
+  everything below it is left out of the slideshow; **Include again** brings it back. Settings are saved to
   `~/.config/frame/settings.txt` (`%APPDATA%\frame\settings.txt` on Windows).
 - Keyboard: Left/Right arrow for previous/next, Space to pause, Delete to trash.
 - On X11 the window sits below all other windows, like a desktop widget. On Wayland there is no
