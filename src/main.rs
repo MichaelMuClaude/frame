@@ -29,8 +29,10 @@ const TOAST_SECS: u64 = 8;
 
 /// What the Undo button in the toast can reverse.
 enum Undo {
-    Trashed(PathBuf),
-    Moved { from: PathBuf, to: PathBuf },
+    /// The photo, and the Live Photo video that went with it.
+    Trashed(PathBuf, Option<PathBuf>),
+    /// `video` holds the Live Photo video's old and new paths.
+    Moved { from: PathBuf, to: PathBuf, video: Option<(PathBuf, PathBuf)> },
 }
 
 /// What a folder-picker dialog was opened for.
@@ -271,13 +273,19 @@ impl App {
 
     fn delete_current(&mut self) {
         let Some((path, _)) = self.shown.clone() else { return };
-        match trash::delete(&path) {
+        let video = live_video(&path);
+        let result = match &video {
+            Some(v) => trash::delete_all([&path, v]),
+            None => trash::delete(&path),
+        };
+        match result {
             Ok(()) => {
                 self.shown = None;
                 self.cache.remove(&path);
                 self.remove_from_queue(&path);
-                self.last_action = Some(Undo::Trashed(path));
-                self.toast = Some(("Moved to Trash".into(), Instant::now(), true));
+                let msg = if video.is_some() { "Moved to Trash (with its video)" } else { "Moved to Trash" };
+                self.last_action = Some(Undo::Trashed(path, video));
+                self.toast = Some((msg.into(), Instant::now(), true));
             }
             Err(e) => {
                 self.toast = Some((format!("Trash failed: {e}"), Instant::now(), false));
@@ -291,13 +299,20 @@ impl App {
 
     fn undo(&mut self) {
         let msg = match self.last_action.take() {
-            Some(Undo::Trashed(path)) => self.undo_trash(path),
-            Some(Undo::Moved { from, to }) => {
-                let dest = if from.exists() { unique_path(&from) } else { from };
+            Some(Undo::Trashed(path, video)) => self.undo_trash(path, video),
+            Some(Undo::Moved { from, to, video }) => {
+                let dest = free_name(&from, video.as_ref().map(|(old, _)| old.as_path()));
                 match move_file(&to, &dest) {
                     Ok(()) => {
+                        let note = match &video {
+                            Some((_, now)) => match move_file(now, &with_video_ext(&dest, now)) {
+                                Ok(()) => "",
+                                Err(_) => " (its video stayed behind)",
+                            },
+                            None => "",
+                        };
                         self.reinsert(dest);
-                        "Moved back".to_string()
+                        format!("Moved back{note}")
                     }
                     Err(e) => format!("Undo failed: {e}"),
                 }
@@ -315,54 +330,72 @@ impl App {
     }
 
     #[cfg(not(target_os = "macos"))]
-    fn undo_trash(&mut self, target: PathBuf) -> String {
-        match trash::os_limited::list() {
-            Ok(items) => {
-                let mut found: Vec<_> = items.into_iter().filter(|i| i.original_path() == target).collect();
-                found.sort_by_key(|i| i.time_deleted);
-                match found.pop() {
-                    Some(item) => match trash::os_limited::restore_all([item]) {
-                        Ok(()) => {
-                            self.reinsert(target);
-                            "Restored".to_string()
-                        }
-                        Err(e) => format!("Restore failed: {e}"),
-                    },
-                    None => "Not found in Trash".to_string(),
-                }
+    fn undo_trash(&mut self, target: PathBuf, video: Option<PathBuf>) -> String {
+        let mut items = match trash::os_limited::list() {
+            Ok(items) => items,
+            Err(e) => return format!("Restore failed: {e}"),
+        };
+        items.sort_by_key(|i| i.time_deleted);
+        let mut restore = Vec::new();
+        for want in std::iter::once(&target).chain(video.as_ref()) {
+            if let Some(i) = items.iter().rposition(|it| it.original_path() == *want) {
+                restore.push(items.remove(i));
+            }
+        }
+        if !restore.iter().any(|it| it.original_path() == target) {
+            return "Not found in Trash".to_string();
+        }
+        match trash::os_limited::restore_all(restore) {
+            Ok(()) => {
+                self.reinsert(target);
+                "Restored".to_string()
             }
             Err(e) => format!("Restore failed: {e}"),
         }
     }
 
     #[cfg(target_os = "macos")]
-    fn undo_trash(&mut self, _target: PathBuf) -> String {
+    fn undo_trash(&mut self, _target: PathBuf, _video: Option<PathBuf>) -> String {
         "Undo not supported here".to_string()
     }
 
     fn move_current_to(&mut self, photo: PathBuf, dir: PathBuf) {
         let Some(name) = photo.file_name() else { return };
-        let mut dest = dir.join(name);
-        if dest == photo {
+        let target = dir.join(name);
+        if target == photo {
             self.toast = Some(("Already in that folder".into(), Instant::now(), false));
             return;
         }
-        if dest.exists() {
-            dest = unique_path(&dest);
-        }
+        let video = live_video(&photo);
+        let dest = free_name(&target, video.as_deref());
         match move_file(&photo, &dest) {
             Ok(()) => {
+                // A Live Photo's video keeps the photo's name so the pair stays together.
+                let mut video_moved = None;
+                let mut video_err = None;
+                if let Some(v) = &video {
+                    let vdest = with_video_ext(&dest, v);
+                    match move_file(v, &vdest) {
+                        Ok(()) => video_moved = Some((v.clone(), vdest)),
+                        Err(e) => video_err = Some(e),
+                    }
+                }
                 self.cache.remove(&photo);
                 if self.shown.as_ref().is_some_and(|(p, _)| *p == photo) {
                     self.shown = None;
                 }
                 self.remove_from_queue(&photo);
-                self.last_action = Some(Undo::Moved { from: photo, to: dest });
                 let label = dir
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| dir.display().to_string());
-                self.toast = Some((format!("Moved to {label}"), Instant::now(), true));
+                let msg = match (&video_moved, &video_err) {
+                    (_, Some(e)) => format!("Moved to {label}, but its video failed: {e}"),
+                    (Some(_), None) => format!("Moved to {label} (with its video)"),
+                    (None, None) => format!("Moved to {label}"),
+                };
+                self.last_action = Some(Undo::Moved { from: photo, to: dest, video: video_moved });
+                self.toast = Some((msg, Instant::now(), true));
                 self.settings.recent.retain(|p| *p != dir);
                 self.settings.recent.insert(0, dir);
                 self.settings.recent.truncate(8);
@@ -850,13 +883,32 @@ impl eframe::App for App {
     }
 }
 
-fn unique_path(p: &Path) -> PathBuf {
-    let stem = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-    let ext = p.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
-    let dir = p.parent().unwrap_or(Path::new("."));
+/// The short video that goes with an iPhone Live Photo: same name, `.MOV`, same folder.
+fn live_video(photo: &Path) -> Option<PathBuf> {
+    let ext = photo.extension()?.to_string_lossy().to_lowercase();
+    if !matches!(ext.as_str(), "heic" | "heif" | "jpg" | "jpeg") {
+        return None;
+    }
+    ["MOV", "mov"].iter().map(|e| photo.with_extension(e)).find(|p| p.is_file())
+}
+
+/// `photo`'s name with the video's extension, e.g. `IMG_1 (1).HEIC` -> `IMG_1 (1).MOV`.
+fn with_video_ext(photo: &Path, video: &Path) -> PathBuf {
+    photo.with_extension(video.extension().unwrap_or_default())
+}
+
+/// `base`, or `name (1).ext`, `name (2).ext`... if that is taken (also checking the video's name).
+fn free_name(base: &Path, video: Option<&Path>) -> PathBuf {
+    let free = |c: &Path| !c.exists() && video.is_none_or(|v| !with_video_ext(c, v).exists());
+    if free(base) {
+        return base.to_path_buf();
+    }
+    let stem = base.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let ext = base.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+    let dir = base.parent().unwrap_or(Path::new("."));
     (1..)
         .map(|n| dir.join(format!("{stem} ({n}){ext}")))
-        .find(|c| !c.exists())
+        .find(|c| free(c))
         .expect("an unused name exists")
 }
 

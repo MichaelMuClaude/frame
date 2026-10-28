@@ -16,6 +16,7 @@ TIFF and iPhone HEIC/HEIF photos.
   clean picture frame:
   - **Trash** (top right): moves the photo to the system Trash. An **Undo** button stays for 8 seconds.
   - **Move** (top left): moves the photo to a folder you pick. Recent folders are listed; **Undo** works here too.
+  - For an iPhone Live Photo (a `.HEIC` or `.JPG` with a same-named `.MOV` next to it), Trash and Move take the video along and Undo brings both back. Only the still photo is shown; videos are not played.
   - **Previous** (left edge): goes back to the photo you just saw.
 - Drag the photo to move the window, drag the wooden edges or corners to resize it.
 - Right-click for next/previous, pause, quit, and **Settings...** (photo folders, interval,
