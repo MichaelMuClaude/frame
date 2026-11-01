@@ -1202,6 +1202,11 @@ fn run(renderer: eframe::Renderer) -> eframe::Result {
         .with_decorations(false)
         .with_taskbar(false)
         .with_window_level(level);
+    if let Ok(icon) = image::load_from_memory(include_bytes!("../assets/icon-256.png")) {
+        let icon = icon.to_rgba8();
+        let (width, height) = icon.dimensions();
+        viewport = viewport.with_icon(egui::IconData { rgba: icon.into_raw(), width, height });
+    }
     // Reopen where it was left; ignore values that cannot be a real window.
     if let Some([x, y, w, h]) = cfg.settings.window
         && (200.0..=10000.0).contains(&w)

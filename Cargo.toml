@@ -21,6 +21,10 @@ rfd = "0.17.2"
 trash = "5.2.9"
 walkdir = "2.5.0"
 
+[build-dependencies]
+# Puts the icon into the Windows exe (build.rs).
+winresource = "0.1"
+
 # Windows draws with Direct3D (through wgpu), see main().
 [target.'cfg(windows)'.dependencies]
 eframe = { version = "0.36", default-features = false, features = ["wgpu"] }
