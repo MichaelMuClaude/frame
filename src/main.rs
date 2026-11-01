@@ -760,12 +760,15 @@ fn resize_cursor(d: ResizeDirection) -> CursorIcon {
 }
 
 impl eframe::App for App {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         // Some X11 window managers drop the level requested at creation, so ask again once mapped.
         self.frames += 1;
         if self.sink && self.frames == 3 {
             ctx.send_viewport_cmd(ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnBottom));
+        }
+        if self.sink {
+            keep_at_bottom(&ctx, frame);
         }
         self.poll(&ctx);
         if let Some(a) = self.fit_aspect.take()
@@ -1052,6 +1055,43 @@ impl eframe::App for App {
     }
 }
 
+/// Windows raises a window whenever it is clicked or activated, and winit only sets "stay at the
+/// bottom" once, so after each click or activation the frame is pushed back under other windows.
+#[cfg(windows)]
+fn keep_at_bottom(ctx: &egui::Context, frame: &eframe::Frame) {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{HWND_BOTTOM, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetWindowPos};
+
+    let (released, focus_changed) = ctx.input(|i| {
+        let focused = i.viewport().focused;
+        let changed = i.events.iter().any(|e| matches!(e, egui::Event::WindowFocused(_)));
+        (i.pointer.any_released(), changed || focused.is_none())
+    });
+    if !released && !focus_changed {
+        return;
+    }
+    let Ok(handle) = frame.window_handle() else { return };
+    if let RawWindowHandle::Win32(h) = handle.as_raw() {
+        // SAFETY: the handle belongs to this live window; SetWindowPos only changes its z-order.
+        unsafe {
+            let _ = SetWindowPos(
+                HWND(h.hwnd.get() as *mut _),
+                Some(HWND_BOTTOM),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
+    }
+}
+
+/// X11 window managers keep `_NET_WM_STATE_BELOW` by themselves.
+#[cfg(not(windows))]
+fn keep_at_bottom(_ctx: &egui::Context, _frame: &eframe::Frame) {}
+
 /// The short video that goes with an iPhone Live Photo: same name, `.MOV`, same folder.
 fn live_video(photo: &Path) -> Option<PathBuf> {
     let ext = photo.extension()?.to_string_lossy().to_lowercase();
@@ -1138,7 +1178,8 @@ fn parse_args(st: &Settings) -> Config {
     Config { dirs, interval: Duration::from_secs(interval.max(1)), normal_level, settings: st.clone() }
 }
 
-fn main() -> eframe::Result {
+/// Opens the frame window with the given renderer. Returns once the window is closed.
+fn run(renderer: eframe::Renderer) -> eframe::Result {
     let st = settings::load();
     let cfg = parse_args(&st);
     let level = if cfg.normal_level { egui::WindowLevel::Normal } else { egui::WindowLevel::AlwaysOnBottom };
@@ -1152,13 +1193,15 @@ fn main() -> eframe::Result {
         .with_window_level(level);
     // Reopen where it was left; ignore values that cannot be a real window.
     if let Some([x, y, w, h]) = cfg.settings.window
-        && (200.0..=10000.0).contains(&w) && (160.0..=10000.0).contains(&h) {
-            viewport = viewport.with_inner_size([w, h]);
-            if (-1000.0..=20000.0).contains(&x) && (-1000.0..=20000.0).contains(&y) {
-                viewport = viewport.with_position([x, y]);
-            }
+        && (200.0..=10000.0).contains(&w)
+        && (160.0..=10000.0).contains(&h)
+    {
+        viewport = viewport.with_inner_size([w, h]);
+        if (-1000.0..=20000.0).contains(&x) && (-1000.0..=20000.0).contains(&y) {
+            viewport = viewport.with_position([x, y]);
         }
-    let options = eframe::NativeOptions { viewport, ..Default::default() };
+    }
+    let options = eframe::NativeOptions { viewport, renderer, ..Default::default() };
     let mut cfg = Some(cfg);
     eframe::run_native(
         "frame",
@@ -1168,4 +1211,26 @@ fn main() -> eframe::Result {
             Ok(Box::new(App::new(&cc.egui_ctx, cfg.take().expect("single init"))))
         }),
     )
+}
+
+/// Linux uses OpenGL. Windows uses Direct3D through wgpu first: many Windows machines (virtual
+/// machines, remote sessions, basic display drivers) have no OpenGL 2, while Direct3D always has
+/// Windows' own software renderer to fall back on. OpenGL is the second choice there.
+fn main() -> eframe::Result {
+    #[cfg(windows)]
+    let result = run(eframe::Renderer::Wgpu).or_else(|e| {
+        eprintln!("frame: Direct3D failed ({e}), trying OpenGL");
+        run(eframe::Renderer::Glow)
+    });
+    #[cfg(not(windows))]
+    let result = run(eframe::Renderer::Glow);
+    if let Err(e) = &result {
+        // A Windows GUI program has no console to print to, so say it in a message box.
+        rfd::MessageDialog::new()
+            .set_level(rfd::MessageLevel::Error)
+            .set_title("Frame could not start")
+            .set_description(format!("Frame could not open its window:\n{e}"))
+            .show();
+    }
+    result
 }

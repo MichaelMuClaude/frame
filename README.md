@@ -57,8 +57,13 @@ Windows, use `cargo build --release --no-default-features`; HEIC/HEIF photos are
 
 ## Status
 
-Tested on Linux with an X11 session. The Wayland behaviour and the Windows build have not been
-tested yet. On Windows, libheif has to be provided to the build (for example through vcpkg).
+Tested on Linux with an X11 session, and on Windows 11 (a build without HEIC, cross-compiled with
+`cargo build --release --target x86_64-pc-windows-gnu --no-default-features`): slideshow, Trash
+to the Recycle Bin and Undo, Move with a Live Photo video, Show in folder, Settings, Chinese
+file names, dragging, and staying below other windows all work there. On Windows the window is
+drawn with Direct3D (wgpu), so it also runs on machines without OpenGL 2, such as virtual
+machines; OpenGL is tried if Direct3D fails. HEIC on Windows would need libheif in the build
+(for example through vcpkg). The Wayland behaviour has not been tested yet.
 
 Deleting and moving act on your real files. Delete goes to the Trash, and both have an Undo, but
 try it on a copy of a folder first.

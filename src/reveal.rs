@@ -12,9 +12,39 @@ pub fn show_in_folder(path: &Path) -> Result<(), String> {
     imp(path)
 }
 
+/// Windows: the shell call Explorer's own "Open file location" uses. `explorer /select,` opens
+/// the folder too, but on Windows 11 it often fails to select the file, so it is only a fallback.
 #[cfg(windows)]
 fn imp(path: &Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
     use std::os::windows::process::CommandExt;
+
+    use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
+    use windows::Win32::UI::Shell::{ILCreateFromPathW, ILFree, SHOpenFolderAndSelectItems};
+    use windows::core::PCWSTR;
+
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    // SAFETY: `wide` is a NUL-terminated UTF-16 path that outlives the calls; the item list
+    // from ILCreateFromPathW is freed exactly once, and COM is only uninitialised if this
+    // thread initialised it.
+    let selected = unsafe {
+        let com = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let pidl = ILCreateFromPathW(PCWSTR(wide.as_ptr()));
+        let result = if pidl.is_null() {
+            Err("the path could not be resolved".to_string())
+        } else {
+            let r = SHOpenFolderAndSelectItems(pidl, None, 0).map_err(|e| e.to_string());
+            ILFree(Some(pidl));
+            r
+        };
+        if com.is_ok() {
+            CoUninitialize();
+        }
+        result
+    };
+    if selected.is_ok() {
+        return Ok(());
+    }
     // Explorer wants `/select,"C:\a b\c.jpg"`; raw_arg keeps the quotes exactly like that.
     // It also returns a non-zero exit code on success, so only the launch itself is checked.
     Command::new("explorer.exe")
