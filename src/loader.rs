@@ -11,7 +11,13 @@ use image::ImageDecoder;
 /// Longest side photos are shrunk to before they become textures.
 const MAX_SIDE: u32 = 2048;
 const WORKERS: usize = 2;
-const EXTS: [&str; 10] = ["jpg", "jpeg", "png", "webp", "gif", "bmp", "tif", "tiff", "heic", "heif"];
+const EXTS: [&str; 8] = ["jpg", "jpeg", "png", "webp", "gif", "bmp", "tif", "tiff"];
+const HEIF_EXTS: [&str; 2] = ["heic", "heif"];
+
+/// Whether a lower-case file extension is a photo type this build can show.
+fn is_photo_ext(ext: &str) -> bool {
+    EXTS.contains(&ext) || (cfg!(feature = "heic") && HEIF_EXTS.contains(&ext))
+}
 
 pub enum Loaded {
     Ok(PathBuf, ColorImage),
@@ -77,7 +83,7 @@ fn scan(dir: &Path, exclude: &[PathBuf], out: &mut Vec<PathBuf>) {
             continue;
         }
         let ext = entry.path().extension().map(|e| e.to_string_lossy().to_lowercase());
-        if ext.is_some_and(|e| EXTS.contains(&e.as_str())) {
+        if ext.is_some_and(|e| is_photo_ext(&e)) {
             out.push(entry.into_path());
         }
     }
@@ -86,7 +92,7 @@ fn scan(dir: &Path, exclude: &[PathBuf], out: &mut Vec<PathBuf>) {
 fn is_heif(path: &Path) -> bool {
     path.extension()
         .map(|e| e.to_string_lossy().to_lowercase())
-        .is_some_and(|e| e == "heic" || e == "heif")
+        .is_some_and(|e| HEIF_EXTS.contains(&e.as_str()))
 }
 
 fn decode(path: &Path) -> Result<ColorImage, String> {
@@ -113,6 +119,7 @@ fn decode_std(path: &Path) -> Result<image::DynamicImage, String> {
     Ok(img)
 }
 
+#[cfg(feature = "heic")]
 fn decode_heif(path: &Path) -> Result<image::DynamicImage, String> {
     use libheif_rs::{ColorSpace, HeifContext, LibHeif, RgbChroma};
 
@@ -135,6 +142,11 @@ fn decode_heif(path: &Path) -> Result<image::DynamicImage, String> {
     Ok(image::DynamicImage::ImageRgba8(rgba))
 }
 
+#[cfg(not(feature = "heic"))]
+fn decode_heif(_path: &Path) -> Result<image::DynamicImage, String> {
+    Err("this build has no HEIC support".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,7 +158,7 @@ mod tests {
         for sub in ["keep", "skip", "skip/deep", "keep/skipper"] {
             std::fs::create_dir_all(root.join(sub)).unwrap();
         }
-        for f in ["a.jpg", "keep/b.jpg", "skip/c.jpg", "skip/deep/d.heic", "keep/skipper/e.png"] {
+        for f in ["a.jpg", "keep/b.jpg", "skip/c.jpg", "skip/deep/d.webp", "keep/skipper/e.png"] {
             std::fs::write(root.join(f), b"").unwrap();
         }
 

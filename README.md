@@ -18,6 +18,7 @@ TIFF and iPhone HEIC/HEIF photos.
   - **Move** (top left): moves the photo to a folder you pick. Recent folders are listed; **Undo** works here too.
   - For an iPhone Live Photo (a `.HEIC` or `.JPG` with a same-named `.MOV` next to it), Trash and Move take the video along and Undo brings both back. Only the still photo is shown; videos are not played.
   - **Previous** (left edge): goes back to the photo you just saw.
+  - **Show in folder** (bottom right, also in the right-click menu): opens the file manager with the photo selected (Explorer on Windows, Finder on macOS, and on Linux any file manager that supports the freedesktop `ShowItems` call, otherwise it just opens the folder).
 - Drag the photo to move the window, drag the wooden edges or corners to resize it.
 - Right-click for next/previous, pause, quit, and **Settings...** (photo folders, folders to
   exclude, interval, whether the frame follows each photo's shape). An excluded folder and
@@ -46,6 +47,9 @@ cargo build --release
 ```
 
 The binary is `target/release/frame`.
+
+HEIC support is the `heic` cargo feature (on by default). To build without libheif, for example for
+Windows, use `cargo build --release --no-default-features`; HEIC/HEIF photos are then not listed.
 
 ## Status
 

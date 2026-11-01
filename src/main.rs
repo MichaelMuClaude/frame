@@ -1,7 +1,11 @@
 //! A small, resizable desktop photo frame: shows random photos from a folder
 //! and lets you send the current one to the Trash by hovering and clicking.
 
+// Windows: a GUI program, so double-clicking the .exe does not open a console window.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 mod loader;
+mod reveal;
 mod settings;
 
 use std::collections::{HashMap, HashSet};
@@ -441,6 +445,14 @@ impl App {
         });
     }
 
+    /// Opens the file manager with the current photo selected.
+    fn show_current_in_folder(&mut self) {
+        let Some((path, _)) = &self.shown else { return };
+        if let Err(e) = reveal::show_in_folder(path) {
+            self.toast = Some((format!("Could not open the folder: {e}"), Instant::now(), false));
+        }
+    }
+
     fn rescan(&mut self, ctx: &egui::Context) {
         self.scan_rx = loader::spawn_scan(ctx.clone(), self.dirs.clone(), self.settings.exclude.clone());
         self.scanned = false;
@@ -821,6 +833,10 @@ impl eframe::App for App {
                 self.paused = !self.paused;
                 ui.close();
             }
+            if ui.add_enabled(self.shown.is_some(), egui::Button::new("Show in folder")).clicked() {
+                self.show_current_in_folder();
+                ui.close();
+            }
             ui.separator();
             if ui.button("Settings...").clicked() {
                 self.settings_open = true;
@@ -893,6 +909,22 @@ impl eframe::App for App {
             }
             if self.move_menu {
                 self.draw_move_menu(ui, &ctx, &painter, mv, rect);
+            }
+            // "Show in folder" button (bottom-right): reveal the photo in the file manager.
+            let folder = Rect::from_min_size(overlay.right_bottom() + vec2(-122.0, -36.0), vec2(114.0, 28.0));
+            let folder_resp = ui.interact(folder, Id::new("show-in-folder"), Sense::click());
+            let folder_fill = if folder_resp.hovered() {
+                Color32::from_rgba_unmultiplied(90, 90, 90, 235)
+            } else {
+                Color32::from_black_alpha(150)
+            };
+            painter.rect_filled(folder, 6.0, folder_fill);
+            painter.text(folder.center(), Align2::CENTER_CENTER, "Show in folder", FontId::proportional(13.0), Color32::WHITE);
+            if folder_resp.hovered() {
+                ctx.set_cursor_icon(CursorIcon::PointingHand);
+            }
+            if folder_resp.clicked() {
+                self.show_current_in_folder();
             }
         }
 
