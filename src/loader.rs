@@ -14,9 +14,15 @@ const WORKERS: usize = 2;
 const EXTS: [&str; 8] = ["jpg", "jpeg", "png", "webp", "gif", "bmp", "tif", "tiff"];
 const HEIF_EXTS: [&str; 2] = ["heic", "heif"];
 
+/// HEIC photos are read with libheif when built with the `heic` feature, otherwise on Windows
+/// with the system codec.
+const HAS_HEIF: bool = cfg!(any(feature = "heic", windows));
+/// The error a HEIC photo gives on a Windows without the codec, so the app can explain it once.
+pub const HEIF_CODEC_MISSING: &str = "HEIC photos need the HEIF and HEVC extensions from the Microsoft Store";
+
 /// Whether a lower-case file extension is a photo type this build can show.
 fn is_photo_ext(ext: &str) -> bool {
-    EXTS.contains(&ext) || (cfg!(feature = "heic") && HEIF_EXTS.contains(&ext))
+    EXTS.contains(&ext) || (HAS_HEIF && HEIF_EXTS.contains(&ext))
 }
 
 pub enum Loaded {
@@ -175,7 +181,12 @@ fn decode_heif(path: &Path) -> Result<image::DynamicImage, String> {
     Ok(image::DynamicImage::ImageRgba8(rgba))
 }
 
-#[cfg(not(feature = "heic"))]
+#[cfg(all(windows, not(feature = "heic")))]
+fn decode_heif(path: &Path) -> Result<image::DynamicImage, String> {
+    crate::wic::decode(path).map(image::DynamicImage::ImageRgba8)
+}
+
+#[cfg(not(any(feature = "heic", windows)))]
 fn decode_heif(_path: &Path) -> Result<image::DynamicImage, String> {
     Err("this build has no HEIC support".into())
 }
@@ -218,5 +229,35 @@ mod tests {
             assert_eq!(via_link.len(), 3, "{via_link:?}");
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn heif_photos_come_out_upright() {
+        if !HAS_HEIF {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("frame-heif-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // The second photo is stored sideways with a rotation tag, the way phone cameras save
+        // portrait photos. Both have a white arrow at the top centre when shown the right way up.
+        let photos: [(&str, &[u8], [usize; 2]); 2] = [
+            ("landscape.heic", include_bytes!("../tests/data/landscape.heic"), [1600, 1000]),
+            ("portrait-rotated.heic", include_bytes!("../tests/data/portrait-rotated.heic"), [1000, 1600]),
+        ];
+        for (name, bytes, size) in photos {
+            let path = dir.join(name);
+            std::fs::write(&path, bytes).unwrap();
+            let img = match decode(&path) {
+                Err(e) if e == HEIF_CODEC_MISSING => {
+                    eprintln!("skipped: {e}");
+                    break;
+                }
+                other => other.unwrap(),
+            };
+            assert_eq!(img.size, size, "{name}");
+            let arrow = img.pixels[150 * size[0] + size[0] / 2];
+            assert!(arrow.r() > 200 && arrow.g() > 200 && arrow.b() > 200, "{name} is not upright: {arrow:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

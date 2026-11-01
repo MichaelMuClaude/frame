@@ -8,6 +8,8 @@ mod fonts;
 mod loader;
 mod reveal;
 mod settings;
+#[cfg(windows)]
+mod wic;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -92,6 +94,8 @@ struct App {
     /// Window position and size last written to the settings, and a change waiting to be saved.
     saved_geometry: Option<[f32; 4]>,
     geometry_changed: Option<([f32; 4], Instant)>,
+    /// Whether the user has been told that Windows lacks the HEIC codec.
+    heif_warned: bool,
 }
 
 impl App {
@@ -126,6 +130,7 @@ impl App {
             reveal_rx: None,
             saved_geometry: cfg.settings.window,
             geometry_changed: None,
+            heif_warned: false,
             settings: cfg.settings,
         }
     }
@@ -232,6 +237,10 @@ impl App {
                 }
                 Loaded::Err(path, err) => {
                     eprintln!("skip {}: {err}", path.display());
+                    if err == loader::HEIF_CODEC_MISSING && !self.heif_warned {
+                        self.heif_warned = true;
+                        self.toast = Some((err, Instant::now(), false));
+                    }
                     self.pending.remove(&path);
                     self.remove_from_queue(&path);
                 }
@@ -842,6 +851,8 @@ impl eframe::App for App {
             None => {
                 let msg = if !self.scanned {
                     "Scanning photos..."
+                } else if self.queue.is_empty() && self.heif_warned {
+                    "No photos found\n\nHEIC photos need the HEIF and HEVC\nextensions from the Microsoft Store"
                 } else if self.queue.is_empty() {
                     "No photos found"
                 } else {

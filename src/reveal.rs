@@ -99,7 +99,7 @@ fn run(cmd: &mut Command) -> Result<(), String> {
 }
 
 /// `file:///home/me/My%20Photos/a.jpg`: everything except unreserved characters and `/` is %-encoded.
-#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+#[cfg(all(unix, any(test, not(target_os = "macos"))))]
 fn file_uri(path: &Path) -> String {
     use std::os::unix::ffi::OsStrExt;
     let mut out = String::from("file://");

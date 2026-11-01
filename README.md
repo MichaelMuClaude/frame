@@ -52,18 +52,21 @@ cargo build --release
 
 The binary is `target/release/frame`.
 
-HEIC support is the `heic` cargo feature (on by default). To build without libheif, for example for
-Windows, use `cargo build --release --no-default-features`; HEIC/HEIF photos are then not listed.
+HEIC support is the `heic` cargo feature (on by default), which uses libheif. To build without
+libheif, use `cargo build --release --no-default-features`; HEIC/HEIF photos are then not listed,
+except on Windows, where they are read with the system's own codec instead (the free "HEIF Image
+Extensions" and "HEVC Video Extensions" from the Microsoft Store, preinstalled on many PCs). If
+those are missing, frame says so instead of silently skipping the photos.
 
 ## Status
 
-Tested on Linux with an X11 session, and on Windows 11 (a build without HEIC, cross-compiled with
-`cargo build --release --target x86_64-pc-windows-gnu --no-default-features`): slideshow, Trash
+Tested on Linux with an X11 session, and on Windows 11 (cross-compiled with
+`cargo build --release --target x86_64-pc-windows-gnu --no-default-features`): slideshow, HEIC
+photos (including rotated and tiled ones), Trash
 to the Recycle Bin and Undo, Move with a Live Photo video, Show in folder, Settings, Chinese
 file names, dragging, and staying below other windows all work there. On Windows the window is
 drawn with Direct3D (wgpu), so it also runs on machines without OpenGL 2, such as virtual
-machines; OpenGL is tried if Direct3D fails. HEIC on Windows would need libheif in the build
-(for example through vcpkg). The Wayland behaviour has not been tested yet.
+machines; OpenGL is tried if Direct3D fails. The Wayland behaviour has not been tested yet.
 
 Deleting and moving act on your real files. Delete goes to the Trash, and both have an Undo, but
 try it on a copy of a folder first.
