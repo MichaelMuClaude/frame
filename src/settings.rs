@@ -13,11 +13,13 @@ pub struct Settings {
     pub recent: Vec<PathBuf>,
     pub interval: u64,
     pub fit: bool,
+    /// Window position and size (x, y, width, height) when it was last moved or resized.
+    pub window: Option<[f32; 4]>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { dirs: Vec::new(), exclude: Vec::new(), recent: Vec::new(), interval: 10, fit: true }
+        Self { dirs: Vec::new(), exclude: Vec::new(), recent: Vec::new(), interval: 10, fit: true, window: None }
     }
 }
 
@@ -48,6 +50,12 @@ pub fn load() -> Settings {
                 }
             }
             "fit" => st.fit = value.trim() != "0",
+            "window" => {
+                let v: Vec<f32> = value.split(',').filter_map(|n| n.trim().parse().ok()).collect();
+                if let [x, y, w, h] = v[..] {
+                    st.window = Some([x, y, w, h]);
+                }
+            }
             _ => {}
         }
     }
@@ -67,6 +75,9 @@ pub fn save(st: &Settings) {
         out.push_str(&format!("recent={}\n", d.display()));
     }
     out.push_str(&format!("interval={}\nfit={}\n", st.interval, u8::from(st.fit)));
+    if let Some([x, y, w, h]) = st.window {
+        out.push_str(&format!("window={x:.0},{y:.0},{w:.0},{h:.0}\n"));
+    }
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }

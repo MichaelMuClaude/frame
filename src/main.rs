@@ -4,6 +4,7 @@
 // Windows: a GUI program, so double-clicking the .exe does not open a console window.
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod fonts;
 mod loader;
 mod reveal;
 mod settings;
@@ -30,6 +31,8 @@ const WOOD_RIGHT: Color32 = Color32::from_rgb(98, 62, 33);
 const WOOD_BOTTOM: Color32 = Color32::from_rgb(82, 51, 27);
 const EDGE: f32 = 7.0;
 const TOAST_SECS: u64 = 8;
+/// How long the window has to stay put after a move or resize before its geometry is saved.
+const GEOMETRY_SAVE_DELAY: Duration = Duration::from_millis(1500);
 
 /// What the Undo button in the toast can reverse.
 enum Undo {
@@ -84,6 +87,11 @@ struct App {
     fit_aspect: Option<f32>,
     /// Photos shown before the current one, most recent last.
     history: Vec<PathBuf>,
+    /// Result of a "Show in folder" running in the background.
+    reveal_rx: Option<Receiver<Result<(), String>>>,
+    /// Window position and size last written to the settings, and a change waiting to be saved.
+    saved_geometry: Option<[f32; 4]>,
+    geometry_changed: Option<([f32; 4], Instant)>,
 }
 
 impl App {
@@ -115,6 +123,9 @@ impl App {
             fit: cfg.settings.fit,
             fit_aspect: None,
             history: Vec::new(),
+            reveal_rx: None,
+            saved_geometry: cfg.settings.window,
+            geometry_changed: None,
             settings: cfg.settings,
         }
     }
@@ -141,7 +152,10 @@ impl App {
         }
         ctx.send_viewport_cmd(ViewportCommand::InnerSize(size));
         if let Some(outer) = ctx.input(|i| i.viewport().outer_rect) {
-            ctx.send_viewport_cmd(ViewportCommand::OuterPosition(outer.center() - size / 2.0));
+            let mut pos = outer.center() - size / 2.0;
+            // Growing taller around the centre must not push the top (and its buttons) off screen.
+            pos.y = pos.y.max(0.0);
+            ctx.send_viewport_cmd(ViewportCommand::OuterPosition(pos));
         }
     }
 
@@ -178,9 +192,9 @@ impl App {
             Err(mpsc::TryRecvError::Disconnected) => Some(None),
             Err(mpsc::TryRecvError::Empty) => None,
         });
-        if let Some(res) = picked {
-            if let Some((kind, _)) = self.pick.take() {
-                if let Some(dir) = res {
+        if let Some(res) = picked
+            && let Some((kind, _)) = self.pick.take()
+                && let Some(dir) = res {
                     match kind {
                         Pick::MoveTo(photo) => self.move_current_to(photo, dir),
                         Pick::AddSource => {
@@ -197,6 +211,10 @@ impl App {
                         }
                     }
                 }
+        if let Some(Ok(res)) = self.reveal_rx.as_ref().map(|rx| rx.try_recv()) {
+            self.reveal_rx = None;
+            if let Err(e) = res {
+                self.toast = Some((format!("Could not open the folder: {e}"), Instant::now(), false));
             }
         }
         while let Ok(mut batch) = self.scan_rx.try_recv() {
@@ -222,13 +240,12 @@ impl App {
         self.prefetch();
         if let Some(p) = self.current_path().cloned() {
             let already = self.shown.as_ref().is_some_and(|(sp, _)| *sp == p);
-            if !already {
-                if let Some(tex) = self.cache.get(&p) {
+            if !already
+                && let Some(tex) = self.cache.get(&p) {
                     self.fit_aspect = Some(tex.aspect_ratio());
                     self.shown = Some((p, tex.clone()));
                     self.shown_at = Instant::now();
                 }
-            }
         }
     }
 
@@ -250,18 +267,21 @@ impl App {
             return;
         }
         if forward {
-            if let Some((p, _)) = &self.shown {
-                if self.history.last() != Some(p) {
+            if let Some((p, _)) = &self.shown
+                && self.history.last() != Some(p) {
                     self.history.push(p.clone());
                     if self.history.len() > 100 {
                         self.history.remove(0);
                     }
                 }
-            }
             self.pos += 1;
             if self.pos >= n {
                 self.pos = 0;
                 self.queue.shuffle(&mut rand::rng());
+                // A new round should not start with the photo that is on screen now.
+                if n > 1 && self.shown.as_ref().is_some_and(|(p, _)| *p == self.queue[0]) {
+                    self.queue.swap(0, n - 1);
+                }
             }
         } else {
             self.pos = (self.pos + n - 1) % n;
@@ -445,12 +465,17 @@ impl App {
         });
     }
 
-    /// Opens the file manager with the current photo selected.
-    fn show_current_in_folder(&mut self) {
-        let Some((path, _)) = &self.shown else { return };
-        if let Err(e) = reveal::show_in_folder(path) {
-            self.toast = Some((format!("Could not open the folder: {e}"), Instant::now(), false));
-        }
+    /// Opens the file manager with the current photo selected. Runs in the background because
+    /// the file manager may first have to start, which can take a few seconds.
+    fn show_current_in_folder(&mut self, ctx: &egui::Context) {
+        let Some((path, _)) = self.shown.clone() else { return };
+        let (tx, rx) = mpsc::channel();
+        self.reveal_rx = Some(rx);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(reveal::show_in_folder(&path));
+            ctx.request_repaint();
+        });
     }
 
     fn rescan(&mut self, ctx: &egui::Context) {
@@ -537,6 +562,34 @@ impl App {
         }
     }
 
+    /// Saves the window position and size once it has stopped moving, so the next start
+    /// opens the frame where it was left (also after a crash).
+    fn track_geometry(&mut self, ctx: &egui::Context) {
+        if self.frames < 10 {
+            return;
+        }
+        let Some((outer, inner)) = ctx.input(|i| i.viewport().outer_rect.zip(i.viewport().inner_rect)) else {
+            return;
+        };
+        let now = [outer.min.x, outer.min.y, inner.width(), inner.height()];
+        let same = |a: [f32; 4], b: [f32; 4]| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1.0);
+        if self.saved_geometry.is_some_and(|s| same(s, now)) {
+            self.geometry_changed = None;
+            return;
+        }
+        match self.geometry_changed {
+            Some((g, since)) if same(g, now) => {
+                if since.elapsed() >= GEOMETRY_SAVE_DELAY {
+                    self.saved_geometry = Some(now);
+                    self.settings.window = Some(now);
+                    self.geometry_changed = None;
+                    settings::save(&self.settings);
+                }
+            }
+            _ => self.geometry_changed = Some((now, Instant::now())),
+        }
+    }
+
     fn settings_viewport(&mut self, ctx: &egui::Context) {
         if !self.settings_open {
             return;
@@ -605,21 +658,19 @@ impl App {
                 close = true;
             }
         });
-        if let Some(i) = remove {
-            if i < self.dirs.len() && self.dirs.len() > 1 {
+        if let Some(i) = remove
+            && i < self.dirs.len() && self.dirs.len() > 1 {
                 self.dirs.remove(i);
                 self.save_dirs(ctx);
             }
-        }
         if add {
             self.start_pick(ctx, Pick::AddSource);
         }
-        if let Some(i) = unexclude {
-            if i < self.settings.exclude.len() {
+        if let Some(i) = unexclude
+            && i < self.settings.exclude.len() {
                 self.settings.exclude.remove(i);
                 self.save_exclude(ctx);
             }
-        }
         if add_exclude {
             self.start_pick(ctx, Pick::Exclude);
         }
@@ -717,12 +768,11 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnBottom));
         }
         self.poll(&ctx);
-        if let Some(a) = self.fit_aspect.take() {
-            if self.fit {
+        if let Some(a) = self.fit_aspect.take()
+            && self.fit {
                 // Extremely wide or tall photos keep their letterbox instead of a sliver of a frame.
                 self.fit_window(&ctx, a.clamp(0.5, 2.0));
             }
-        }
 
         // Keyboard shortcuts.
         let (next, prev, del, pause) = ctx.input(|i| {
@@ -747,6 +797,9 @@ impl eframe::App for App {
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.move_menu = false;
+        }
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Z)) {
+            self.undo();
         }
 
         // Auto-advance once the current photo has been on screen long enough.
@@ -834,7 +887,7 @@ impl eframe::App for App {
                 ui.close();
             }
             if ui.add_enabled(self.shown.is_some(), egui::Button::new("Show in folder")).clicked() {
-                self.show_current_in_folder();
+                self.show_current_in_folder(&ctx);
                 ui.close();
             }
             ui.separator();
@@ -854,13 +907,26 @@ impl eframe::App for App {
         if (hovering || self.move_menu) && self.shown.is_some() {
             if let Some((path, _)) = &self.shown {
                 let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                let galley = painter.layout_no_wrap(name, FontId::proportional(12.0), Color32::WHITE);
+                // One line, cut with "…" so a long name stops before the Show in folder button.
+                let mut job = egui::text::LayoutJob::simple_singleline(name, FontId::proportional(12.0), Color32::WHITE);
+                job.wrap = egui::text::TextWrapping {
+                    max_width: (overlay.width() - 150.0).max(40.0),
+                    max_rows: 1,
+                    break_anywhere: true,
+                    overflow_character: Some('…'),
+                };
+                let galley = painter.layout_job(job);
                 let r = Rect::from_min_size(
                     overlay.left_bottom() + vec2(6.0, -galley.size().y - 8.0),
                     galley.size() + vec2(10.0, 6.0),
                 );
                 painter.rect_filled(r, 4.0, Color32::from_black_alpha(150));
                 painter.galley(r.min + vec2(5.0, 3.0), galley, Color32::WHITE);
+            }
+            if self.paused {
+                let r = Rect::from_center_size(overlay.center_top() + vec2(0.0, 22.0), vec2(70.0, 24.0));
+                painter.rect_filled(r, 6.0, Color32::from_black_alpha(150));
+                painter.text(r.center(), Align2::CENTER_CENTER, "Paused", FontId::proportional(13.0), Color32::WHITE);
             }
             // "Previous photo" button: a round chevron at the left edge of the photo.
             let c = overlay.left_center() + vec2(26.0, 0.0);
@@ -924,7 +990,7 @@ impl eframe::App for App {
                 ctx.set_cursor_icon(CursorIcon::PointingHand);
             }
             if folder_resp.clicked() {
-                self.show_current_in_folder();
+                self.show_current_in_folder(&ctx);
             }
         }
 
@@ -935,7 +1001,8 @@ impl eframe::App for App {
             } else {
                 let text_w = painter.layout_no_wrap(msg.clone(), FontId::proportional(13.0), Color32::WHITE).size().x;
                 let w = (text_w + 28.0 + if undoable { 62.0 } else { 0.0 }).min(photo_area.width());
-                let r = Rect::from_center_size(photo_area.center_bottom() + vec2(0.0, -24.0), vec2(w, 32.0));
+                // Above the bottom row (file name, Show in folder) so it never covers those.
+                let r = Rect::from_center_size(photo_area.center_bottom() + vec2(0.0, -62.0), vec2(w, 32.0));
                 painter.rect_filled(r, 8.0, Color32::from_black_alpha(215));
                 painter.text(
                     r.left_center() + vec2(12.0, 0.0),
@@ -958,8 +1025,30 @@ impl eframe::App for App {
         }
 
         self.settings_viewport(&ctx);
+        self.track_geometry(&ctx);
 
-        ctx.request_repaint_after(Duration::from_millis(500));
+        // Draw again only when something is due (input, loading and dialogs wake the window
+        // themselves), instead of redrawing twice a second forever.
+        let mut next = Duration::from_secs(60);
+        if self.frames < 10 {
+            next = Duration::from_millis(100);
+        }
+        // The slideshow moved on during this frame (timer, key, Trash...): show the new photo
+        // right away instead of at the next timer tick.
+        let showing_now = self.current_path().zip(self.shown.as_ref()).is_some_and(|(c, (s, _))| c == s);
+        if !showing_now && !self.queue.is_empty() {
+            next = next.min(Duration::from_millis(30));
+        }
+        if let Some((_, at, _)) = &self.toast {
+            next = next.min(Duration::from_secs(TOAST_SECS).saturating_sub(at.elapsed()) + Duration::from_millis(50));
+        }
+        if !self.paused && !self.busy() && !self.hover_photo && showing_current && self.queue.len() > 1 {
+            next = next.min(self.interval.saturating_sub(self.shown_at.elapsed()) + Duration::from_millis(20));
+        }
+        if let Some((_, since)) = self.geometry_changed {
+            next = next.min(GEOMETRY_SAVE_DELAY.saturating_sub(since.elapsed()) + Duration::from_millis(50));
+        }
+        ctx.request_repaint_after(next);
     }
 }
 
@@ -993,12 +1082,16 @@ fn free_name(base: &Path, video: Option<&Path>) -> PathBuf {
 }
 
 /// Renames, or copies and deletes when the folders are on different drives.
+/// Never leaves two copies behind: if the original cannot be deleted, the copy is removed again.
 fn move_file(from: &Path, to: &Path) -> std::io::Result<()> {
-    if std::fs::rename(from, to).is_ok() {
-        return Ok(());
+    match std::fs::rename(from, to) {
+        Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {}
+        other => return other,
     }
     std::fs::copy(from, to)?;
-    std::fs::remove_file(from)
+    std::fs::remove_file(from).inspect_err(|_| {
+        let _ = std::fs::remove_file(to);
+    })
 }
 
 /// Wayland compositors (GNOME, KDE) have no "stay below other windows" level, so there the
@@ -1026,7 +1119,13 @@ fn parse_args(st: &Settings) -> Config {
                 );
                 std::process::exit(0);
             }
-            _ => dirs.push(PathBuf::from(a)),
+            flag if flag.starts_with('-') => {
+                eprintln!("frame: unknown option {flag} (see --help)");
+                std::process::exit(2);
+            }
+            // Absolute, so Undo can find the photo in the Trash (which records full paths)
+            // and excluded folders (picked as full paths) match.
+            _ => dirs.push(std::path::absolute(&a).unwrap_or_else(|_| PathBuf::from(&a))),
         }
     }
     if dirs.is_empty() {
@@ -1043,21 +1142,30 @@ fn main() -> eframe::Result {
     let st = settings::load();
     let cfg = parse_args(&st);
     let level = if cfg.normal_level { egui::WindowLevel::Normal } else { egui::WindowLevel::AlwaysOnBottom };
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("Frame")
-            .with_app_id("frame")
-            .with_inner_size([520.0, 360.0])
-            .with_min_inner_size([200.0, 160.0])
-            .with_decorations(false)
-            .with_taskbar(false)
-            .with_window_level(level),
-        ..Default::default()
-    };
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("Frame")
+        .with_app_id("frame")
+        .with_inner_size([520.0, 360.0])
+        .with_min_inner_size([200.0, 160.0])
+        .with_decorations(false)
+        .with_taskbar(false)
+        .with_window_level(level);
+    // Reopen where it was left; ignore values that cannot be a real window.
+    if let Some([x, y, w, h]) = cfg.settings.window
+        && (200.0..=10000.0).contains(&w) && (160.0..=10000.0).contains(&h) {
+            viewport = viewport.with_inner_size([w, h]);
+            if (-1000.0..=20000.0).contains(&x) && (-1000.0..=20000.0).contains(&y) {
+                viewport = viewport.with_position([x, y]);
+            }
+        }
+    let options = eframe::NativeOptions { viewport, ..Default::default() };
     let mut cfg = Some(cfg);
     eframe::run_native(
         "frame",
         options,
-        Box::new(move |cc| Ok(Box::new(App::new(&cc.egui_ctx, cfg.take().expect("single init"))))),
+        Box::new(move |cc| {
+            fonts::add_cjk_fallback(&cc.egui_ctx);
+            Ok(Box::new(App::new(&cc.egui_ctx, cfg.take().expect("single init"))))
+        }),
     )
 }

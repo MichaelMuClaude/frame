@@ -24,7 +24,11 @@ TIFF and iPhone HEIC/HEIF photos.
   exclude, interval, whether the frame follows each photo's shape). An excluded folder and
   everything below it is left out of the slideshow; **Include again** brings it back. Settings are saved to
   `~/.config/frame/settings.txt` (`%APPDATA%\frame\settings.txt` on Windows).
-- Keyboard: Left/Right arrow for previous/next, Space to pause, Delete to trash.
+- Keyboard: Left/Right arrow for previous/next, Space to pause (a "Paused" label shows on hover), Delete to trash,
+  Ctrl+Z to undo the last Trash or Move.
+- The window reopens where you left it, at the same size.
+- File names in Chinese, Japanese or Korean are drawn with a font from your system (Noto Sans CJK,
+  Microsoft YaHei, PingFang...), since egui's built-in fonts do not have those characters.
 - On X11 the window sits below all other windows, like a desktop widget. On Wayland there is no
   such window level, so it opens as an ordinary window. `--normal` forces that everywhere.
 

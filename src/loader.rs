@@ -29,14 +29,49 @@ pub enum Loaded {
 pub fn spawn_scan(ctx: egui::Context, dirs: Vec<PathBuf>, exclude: Vec<PathBuf>) -> Receiver<Vec<PathBuf>> {
     let (scan_tx, scan_rx) = mpsc::channel();
     thread::spawn(move || {
-        let mut found = Vec::new();
-        for dir in dirs {
-            scan(&dir, &exclude, &mut found);
-        }
-        let _ = scan_tx.send(found);
+        let _ = scan_tx.send(collect(&dirs, &exclude));
         ctx.request_repaint();
     });
     scan_rx
+}
+
+/// Every photo in `dirs`, each listed once even when the folders overlap.
+fn collect(dirs: &[PathBuf], exclude: &[PathBuf]) -> Vec<PathBuf> {
+    let ex = Exclude::new(exclude);
+    let mut found = Vec::new();
+    for dir in dirs {
+        scan(dir, &ex, &mut found);
+    }
+    found.sort();
+    found.dedup();
+    found
+}
+
+/// Excluded folders, also in their resolved form, so a folder reached through a symlink
+/// (for example a photo folder that is a link into a sync folder) is still recognised.
+struct Exclude {
+    raw: Vec<PathBuf>,
+    real: Vec<PathBuf>,
+}
+
+impl Exclude {
+    fn new(exclude: &[PathBuf]) -> Self {
+        let real = exclude.iter().filter_map(|p| std::fs::canonicalize(p).ok()).collect();
+        Self { raw: exclude.to_vec(), real }
+    }
+
+    fn contains(&self, entry: &walkdir::DirEntry) -> bool {
+        if self.raw.is_empty() {
+            return false;
+        }
+        let path = entry.path();
+        if self.raw.iter().any(|x| path.starts_with(x)) {
+            return true;
+        }
+        // Resolving costs a system call, so only folders are checked; their files go with them.
+        entry.file_type().is_dir()
+            && std::fs::canonicalize(path).is_ok_and(|real| self.real.iter().any(|x| real.starts_with(x)))
+    }
 }
 
 /// Starts the decoder threads. Returns (job sender, decoded images).
@@ -70,14 +105,12 @@ fn is_hidden(name: &std::ffi::OsStr) -> bool {
     name.to_string_lossy().starts_with('.')
 }
 
-fn scan(dir: &Path, exclude: &[PathBuf], out: &mut Vec<PathBuf>) {
+fn scan(dir: &Path, exclude: &Exclude, out: &mut Vec<PathBuf>) {
     let walker = walkdir::WalkDir::new(dir)
         .into_iter()
         // Skip hidden folders such as .dropbox.cache and .thumbnails (but not the root itself),
         // and excluded folders together with everything below them.
-        .filter_entry(|e| {
-            (e.depth() == 0 || !is_hidden(e.file_name())) && !exclude.iter().any(|x| e.path().starts_with(x))
-        });
+        .filter_entry(|e| (e.depth() == 0 || !is_hidden(e.file_name())) && !exclude.contains(e));
     for entry in walker.flatten() {
         if !entry.file_type().is_file() {
             continue;
@@ -152,7 +185,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn scan_skips_excluded_folders_and_everything_below() {
+    fn collect_skips_excluded_folders_and_duplicates() {
         let root = std::env::temp_dir().join(format!("frame-scan-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         for sub in ["keep", "skip", "skip/deep", "keep/skipper"] {
@@ -162,16 +195,28 @@ mod tests {
             std::fs::write(root.join(f), b"").unwrap();
         }
 
-        let mut found = Vec::new();
-        scan(&root, &[root.join("skip")], &mut found);
-        let mut names: Vec<_> = found.iter().map(|p| p.strip_prefix(&root).unwrap().to_owned()).collect();
-        names.sort();
+        let names = |found: Vec<PathBuf>| -> Vec<PathBuf> {
+            found.iter().map(|p| p.strip_prefix(&root).unwrap().to_owned()).collect()
+        };
+        let found = collect(&[root.clone()], &[root.join("skip")]);
         // "keep/skipper" shares a name prefix with "skip" but is a different folder: it must stay.
-        assert_eq!(names, [PathBuf::from("a.jpg"), "keep/b.jpg".into(), "keep/skipper/e.png".into()]);
+        assert_eq!(names(found), [PathBuf::from("a.jpg"), "keep/b.jpg".into(), "keep/skipper/e.png".into()]);
 
-        let mut all = Vec::new();
-        scan(&root, &[], &mut all);
-        assert_eq!(all.len(), 5);
+        assert_eq!(collect(&[root.clone()], &[]).len(), 5);
+
+        // Overlapping photo folders list each photo once.
+        assert_eq!(collect(&[root.clone(), root.join("keep")], &[]).len(), 5);
+
+        // A photo folder reached through a symlink still honours an exclusion given by its real path.
+        #[cfg(unix)]
+        {
+            let link = std::env::temp_dir().join(format!("frame-scan-link-{}", std::process::id()));
+            let _ = std::fs::remove_file(&link);
+            std::os::unix::fs::symlink(&root, &link).unwrap();
+            let via_link = collect(&[link.clone()], &[root.join("skip")]);
+            let _ = std::fs::remove_file(&link);
+            assert_eq!(via_link.len(), 3, "{via_link:?}");
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 }
