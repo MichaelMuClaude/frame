@@ -1,5 +1,5 @@
 //! Small persistent settings file (`~/.config/frame/settings.txt`, `%APPDATA%\frame\settings.txt` on Windows).
-//! Plain `key=value` lines; `dir`, `exclude` and `recent` may repeat.
+//! Plain `key=value` lines; `dir`, `exclude`, `recent`, `server_dir` and `server_exclude` may repeat.
 
 use std::path::PathBuf;
 
@@ -17,11 +17,19 @@ pub struct Settings {
     pub window: Option<[f32; 4]>,
     /// A frame-web server to show photos from instead of local folders (client mode).
     pub server: Option<String>,
+    /// Client mode: this frame picks its own folders on the server (`server_dirs`,
+    /// `server_exclude`) instead of following the server's settings.
+    pub server_own: bool,
+    /// Client mode, own folders: server folders to show; empty means the whole library.
+    pub server_dirs: Vec<PathBuf>,
+    /// Client mode, own folders: server folders never shown here.
+    pub server_exclude: Vec<PathBuf>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { dirs: Vec::new(), exclude: Vec::new(), recent: Vec::new(), interval: 10, fit: true, window: None, server: None }
+        Self { dirs: Vec::new(), exclude: Vec::new(), recent: Vec::new(), interval: 10, fit: true, window: None, server: None,
+            server_own: false, server_dirs: Vec::new(), server_exclude: Vec::new() }
     }
 }
 
@@ -53,6 +61,9 @@ pub fn load() -> Settings {
             }
             "fit" => st.fit = value.trim() != "0",
             "server" if !value.trim().is_empty() => st.server = Some(value.trim().to_string()),
+            "server_folders" => st.server_own = value.trim() == "own",
+            "server_dir" => st.server_dirs.push(PathBuf::from(value)),
+            "server_exclude" => st.server_exclude.push(PathBuf::from(value)),
             "window" => {
                 let v: Vec<f32> = value.split(',').filter_map(|n| n.trim().parse().ok()).collect();
                 if let [x, y, w, h] = v[..] {
@@ -80,6 +91,15 @@ pub fn save(st: &Settings) {
     out.push_str(&format!("interval={}\nfit={}\n", st.interval, u8::from(st.fit)));
     if let Some(server) = &st.server {
         out.push_str(&format!("server={server}\n"));
+    }
+    if st.server_own {
+        out.push_str("server_folders=own\n");
+        for d in &st.server_dirs {
+            out.push_str(&format!("server_dir={}\n", d.display()));
+        }
+        for d in &st.server_exclude {
+            out.push_str(&format!("server_exclude={}\n", d.display()));
+        }
     }
     if let Some([x, y, w, h]) = st.window {
         out.push_str(&format!("window={x:.0},{y:.0},{w:.0},{h:.0}\n"));

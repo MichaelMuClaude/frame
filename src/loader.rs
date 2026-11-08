@@ -47,13 +47,27 @@ pub fn spawn_scan(ctx: egui::Context, dirs: Vec<PathBuf>, exclude: Vec<PathBuf>)
 }
 
 /// Asks the photo server for its photo list on a background thread (client mode).
-pub fn spawn_remote_scan(ctx: egui::Context, remote: Arc<Remote>) -> Receiver<Scan> {
+pub fn spawn_remote_scan(ctx: egui::Context, remote: Arc<Remote>, own: Option<(Vec<PathBuf>, Vec<PathBuf>)>) -> Receiver<Scan> {
     let (scan_tx, scan_rx) = mpsc::channel();
     thread::spawn(move || {
-        let _ = scan_tx.send(remote.list());
+        let list = match &own {
+            None => remote.list(false),
+            Some((dirs, exclude)) => remote.list(true).map(|all| chosen(all, dirs, exclude)),
+        };
+        let _ = scan_tx.send(list);
         ctx.request_repaint();
     });
     scan_rx
+}
+
+/// Client mode, own folders: the server's photos inside `dirs` (all of them when `dirs` is
+/// empty) and outside `exclude`.
+fn chosen(photos: Vec<PathBuf>, dirs: &[PathBuf], exclude: &[PathBuf]) -> Vec<PathBuf> {
+    photos
+        .into_iter()
+        .filter(|p| dirs.is_empty() || dirs.iter().any(|d| p.starts_with(d)))
+        .filter(|p| !exclude.iter().any(|d| p.starts_with(d)))
+        .collect()
 }
 
 /// Every photo in `dirs`, each listed once even when the folders overlap.
@@ -224,6 +238,16 @@ fn decode_heif(_path: &Path) -> Result<image::DynamicImage, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chosen_keeps_picked_folders_minus_excluded() {
+        let p = |s: &str| PathBuf::from(s);
+        let photos = vec![p("/pics/a.jpg"), p("/pics/x/b.jpg"), p("/pics/trip/c.jpg"), p("/pics/trip/skip/d.jpg"), p("/pics/tripod/e.jpg")];
+        // No folders picked: the whole library, minus the excluded ones.
+        assert_eq!(chosen(photos.clone(), &[], &[p("/pics/x")]), vec![p("/pics/a.jpg"), p("/pics/trip/c.jpg"), p("/pics/trip/skip/d.jpg"), p("/pics/tripod/e.jpg")]);
+        // Folder matching is by whole path parts: "trip" does not take in "tripod".
+        assert_eq!(chosen(photos, &[p("/pics/trip")], &[p("/pics/trip/skip")]), vec![p("/pics/trip/c.jpg")]);
+    }
 
     #[test]
     fn collect_skips_excluded_folders_and_duplicates() {

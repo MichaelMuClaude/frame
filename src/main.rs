@@ -52,6 +52,7 @@ enum Undo {
 }
 
 /// What a folder-picker dialog was opened for.
+#[derive(Clone)]
 enum Pick {
     MoveTo(PathBuf),
     AddSource,
@@ -78,8 +79,9 @@ struct App {
     /// Client mode: the server's folders (for Move), and a refresh of them on its way.
     folders: Option<remote::Folders>,
     folders_rx: Option<Receiver<Result<remote::Folders, String>>>,
-    /// Client mode: the photo whose "Choose folder..." list is open, and its search text.
-    folder_list: Option<(PathBuf, String)>,
+    /// Client mode: what the server-folder list is open for (Move, or the folders this frame
+    /// shows), and its search text.
+    folder_list: Option<(Pick, String)>,
     /// Client mode: ask the server for its photo list again (each new round of the slideshow).
     refresh_remote: bool,
     scanned: bool,
@@ -121,7 +123,7 @@ impl App {
     fn new(ctx: &egui::Context, cfg: Config) -> Self {
         let remote = cfg.settings.server.as_deref().map(|s| Arc::new(remote::Remote::new(s)));
         let scan_rx = match &remote {
-            Some(r) => loader::spawn_remote_scan(ctx.clone(), r.clone()),
+            Some(r) => loader::spawn_remote_scan(ctx.clone(), r.clone(), own_folders(&cfg.settings)),
             None => loader::spawn_scan(ctx.clone(), cfg.dirs.clone(), cfg.settings.exclude.clone()),
         };
         let (job_tx, res_rx) = loader::spawn_workers(ctx.clone(), remote.clone());
@@ -229,21 +231,7 @@ impl App {
         if let Some(res) = picked
             && let Some((kind, _)) = self.pick.take()
                 && let Some(dir) = res {
-                    match kind {
-                        Pick::MoveTo(photo) => self.move_current_to(photo, dir),
-                        Pick::AddSource => {
-                            if !self.dirs.contains(&dir) {
-                                self.dirs.push(dir);
-                                self.save_dirs(ctx);
-                            }
-                        }
-                        Pick::Exclude => {
-                            if !self.settings.exclude.contains(&dir) {
-                                self.settings.exclude.push(dir);
-                                self.save_exclude(ctx);
-                            }
-                        }
-                    }
+                    self.picked(ctx, kind, dir);
                 }
         if let Some(Ok(res)) = self.reveal_rx.as_ref().map(|rx| rx.try_recv()) {
             self.reveal_rx = None;
@@ -585,13 +573,42 @@ impl App {
 
     fn rescan(&mut self, ctx: &egui::Context) {
         self.scan_rx = match &self.remote {
-            Some(r) => loader::spawn_remote_scan(ctx.clone(), r.clone()),
+            Some(r) => loader::spawn_remote_scan(ctx.clone(), r.clone(), own_folders(&self.settings)),
             None => loader::spawn_scan(ctx.clone(), self.dirs.clone(), self.settings.exclude.clone()),
         };
         // An unreachable server is not asked again until this attempt has answered.
         self.scan_error = None;
         if self.queue.is_empty() {
             self.scanned = false;
+        }
+    }
+
+    /// A folder was chosen, in the system dialog or (client mode) from the server's folders.
+    fn picked(&mut self, ctx: &egui::Context, kind: Pick, dir: PathBuf) {
+        let remote = self.remote.is_some();
+        match kind {
+            Pick::MoveTo(photo) => self.move_current_to(photo, dir),
+            Pick::AddSource if remote => {
+                if !self.settings.server_dirs.contains(&dir) {
+                    // Adding an excluded folder means it should be shown after all.
+                    self.settings.server_exclude.retain(|d| d != &dir);
+                    self.settings.server_dirs.push(dir);
+                    self.save_exclude(ctx);
+                }
+            }
+            Pick::AddSource => {
+                if !self.dirs.contains(&dir) {
+                    self.dirs.push(dir);
+                    self.save_dirs(ctx);
+                }
+            }
+            Pick::Exclude => {
+                let list = if remote { &mut self.settings.server_exclude } else { &mut self.settings.exclude };
+                if !list.contains(&dir) {
+                    list.push(dir);
+                    self.save_exclude(ctx);
+                }
+            }
         }
     }
 
@@ -620,9 +637,14 @@ impl App {
 
     /// Client mode: "Choose folder..." lists the server's folders, with a search box.
     fn folder_list_viewport(&mut self, ctx: &egui::Context) {
-        let Some((photo, mut query)) = self.folder_list.clone() else { return };
+        let Some((kind, mut query)) = self.folder_list.clone() else { return };
+        let title = match kind {
+            Pick::MoveTo(_) => "Move photo to...",
+            Pick::AddSource => "Show photos from...",
+            Pick::Exclude => "Never show photos from...",
+        };
         let builder = egui::ViewportBuilder::default()
-            .with_title("Move photo to...")
+            .with_title(title)
             .with_inner_size([380.0, 520.0])
             .with_min_inner_size([260.0, 240.0]);
         let names: Vec<(PathBuf, String)> = self
@@ -654,11 +676,11 @@ impl App {
         });
         if let Some(dir) = chosen {
             self.folder_list = None;
-            self.move_current_to(photo, dir);
+            self.picked(ctx, kind, dir);
         } else if close {
             self.folder_list = None;
         } else {
-            self.folder_list = Some((photo, query));
+            self.folder_list = Some((kind, query));
         }
     }
 
@@ -738,7 +760,7 @@ impl App {
             self.move_menu = false;
             if self.remote.is_some() {
                 self.fetch_folders();
-                self.folder_list = Some((photo, String::new()));
+                self.folder_list = Some((Pick::MoveTo(photo), String::new()));
             } else {
                 self.start_pick(ctx, Pick::MoveTo(photo));
             }
@@ -786,6 +808,16 @@ impl App {
         let dirs = self.dirs.clone();
         let exclude = self.settings.exclude.clone();
         let server = self.remote.as_ref().map(|r| r.base().to_string());
+        if server.is_some() && self.folders.is_none() {
+            self.fetch_folders();
+        }
+        let own = self.settings.server_own;
+        let label = |d: &PathBuf| self.folder_label(d);
+        let server_dirs: Vec<String> = self.settings.server_dirs.iter().map(label).collect();
+        let server_exclude: Vec<String> = self.settings.server_exclude.iter().map(label).collect();
+        let folders_ready = self.folders.is_some();
+        let (mut take_own, mut follow_server) = (false, false);
+        let (mut server_pick, mut server_remove, mut server_include) = (None::<Pick>, None::<usize>, None::<usize>);
         let mut secs = self.interval.as_secs();
         let mut fit = self.fit;
         let (mut close, mut add, mut remove) = (false, false, None::<usize>);
@@ -794,8 +826,60 @@ impl App {
             egui::CentralPanel::default().show(ctx, |ui| {
                 if let Some(server) = &server {
                     ui.heading("Photo server");
-                    ui.label(format!("Photos come from {server}."));
-                    ui.label("Its own settings decide the photo folders. Remove the server= line from the settings file to show local folders again.");
+                    ui.label(format!("Photos come from {server}. Remove the server= line from the settings file to show local folders again."));
+                    ui.separator();
+                    if !own {
+                        ui.label("This frame shows the folders the server's own settings choose (the same as the phone).");
+                        ui.add_space(4.0);
+                        if ui.add_enabled(folders_ready, egui::Button::new("Choose folders for this frame")).clicked() {
+                            take_own = true;
+                        }
+                        if !folders_ready {
+                            ui.weak("Loading folders...");
+                        }
+                    } else {
+                        ui.heading("Photo folders");
+                        ui.label("Photos are picked from these server folders and everything inside them. The phone is not affected.");
+                        ui.add_space(6.0);
+                        if server_dirs.is_empty() {
+                            ui.weak("The whole photo library");
+                        }
+                        for (i, d) in server_dirs.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                if ui.button("Remove").clicked() {
+                                    server_remove = Some(i);
+                                }
+                                ui.label(d);
+                            });
+                        }
+                        ui.add_space(4.0);
+                        if ui.button("Add folder...").clicked() {
+                            server_pick = Some(Pick::AddSource);
+                        }
+                        ui.separator();
+                        ui.heading("Excluded folders");
+                        ui.label("Photos in these folders, and in the folders below them, are never shown here.");
+                        ui.add_space(6.0);
+                        if server_exclude.is_empty() {
+                            ui.weak("None");
+                        }
+                        for (i, d) in server_exclude.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                if ui.button("Include again").clicked() {
+                                    server_include = Some(i);
+                                }
+                                ui.label(d);
+                            });
+                        }
+                        ui.add_space(4.0);
+                        if ui.button("Exclude folder...").clicked() {
+                            server_pick = Some(Pick::Exclude);
+                        }
+                        ui.add_space(6.0);
+                        if ui.button("Follow the server's settings again").clicked() {
+                            follow_server = true;
+                        }
+                    }
                 } else {
                 ui.heading("Photo folders");
                 ui.label("Photos are picked at random from these folders and everything inside them.");
@@ -858,6 +942,33 @@ impl App {
         if add {
             self.start_pick(ctx, Pick::AddSource);
         }
+        if take_own {
+            // Start from what the server shows now: its whole library minus its exclusions.
+            self.settings.server_own = true;
+            self.settings.server_dirs.clear();
+            self.settings.server_exclude = self.folders.as_ref().map(|f| f.excluded.clone()).unwrap_or_default();
+            self.save_exclude(ctx);
+        }
+        if follow_server {
+            self.settings.server_own = false;
+            self.settings.server_dirs.clear();
+            self.settings.server_exclude.clear();
+            self.save_exclude(ctx);
+        }
+        if let Some(i) = server_remove
+            && i < self.settings.server_dirs.len() {
+                self.settings.server_dirs.remove(i);
+                self.save_exclude(ctx);
+            }
+        if let Some(i) = server_include
+            && i < self.settings.server_exclude.len() {
+                self.settings.server_exclude.remove(i);
+                self.save_exclude(ctx);
+            }
+        if let Some(kind) = server_pick {
+            self.fetch_folders();
+            self.folder_list = Some((kind, String::new()));
+        }
         if let Some(i) = unexclude
             && i < self.settings.exclude.len() {
                 self.settings.exclude.remove(i);
@@ -883,6 +994,11 @@ impl App {
 }
 
 /// Width of the wooden frame band, scaled with the window.
+/// Client mode: the folders this frame picked for itself, or None to follow the server's settings.
+fn own_folders(st: &Settings) -> Option<(Vec<PathBuf>, Vec<PathBuf>)> {
+    st.server_own.then(|| (st.server_dirs.clone(), st.server_exclude.clone()))
+}
+
 fn frame_width(rect: Rect) -> f32 {
     (rect.width().min(rect.height()) * 0.055).clamp(10.0, 34.0)
 }

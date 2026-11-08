@@ -20,6 +20,8 @@ pub struct Folders {
     pub roots: Vec<PathBuf>,
     pub all: Vec<PathBuf>,
     pub recent: Vec<PathBuf>,
+    /// Folders the server's own settings leave out of the slideshow.
+    pub excluded: Vec<PathBuf>,
 }
 
 impl Remote {
@@ -56,9 +58,10 @@ impl Remote {
         if ok { Ok(v) } else { Err(error_text(&v)) }
     }
 
-    /// Every photo in the library, as paths on the server.
-    pub fn list(&self) -> Result<Vec<PathBuf>, String> {
-        let v = self.get("/api/photos")?;
+    /// Every photo in the library, as paths on the server. With `all`, also the photos in the
+    /// folders the server's settings exclude (for a frame that picks its own folders).
+    pub fn list(&self, all: bool) -> Result<Vec<PathBuf>, String> {
+        let v = self.get(if all { "/api/photos?all=1" } else { "/api/photos" })?;
         let photos = v["photos"].as_array().ok_or("unexpected reply from the server")?;
         Ok(photos.iter().filter_map(|p| p["path"].as_str()).map(PathBuf::from).collect())
     }
@@ -101,7 +104,7 @@ impl Remote {
         let paths = |key: &str| -> Vec<PathBuf> {
             v[key].as_array().into_iter().flatten().filter_map(|p| p.as_str()).map(PathBuf::from).collect()
         };
-        Ok(Folders { roots: paths("roots"), all: paths("folders"), recent: paths("recent") })
+        Ok(Folders { roots: paths("roots"), all: paths("folders"), recent: paths("recent"), excluded: paths("excluded") })
     }
 }
 
