@@ -6,6 +6,7 @@
 
 mod fonts;
 mod loader;
+mod remote;
 mod reveal;
 mod settings;
 #[cfg(windows)]
@@ -13,6 +14,7 @@ mod wic;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
@@ -36,8 +38,13 @@ const TOAST_SECS: u64 = 8;
 /// How long the window has to stay put after a move or resize before its geometry is saved.
 const GEOMETRY_SAVE_DELAY: Duration = Duration::from_millis(1500);
 
+/// How long to wait before asking an unreachable photo server again.
+const SERVER_RETRY: Duration = Duration::from_secs(30);
+
 /// What the Undo button in the toast can reverse.
 enum Undo {
+    /// A Trash or Move done on the photo server (client mode); the server keeps the details.
+    Remote,
     /// The photo, and the Live Photo video that went with it.
     Trashed(PathBuf, Option<PathBuf>),
     /// `video` holds the Live Photo video's old and new paths.
@@ -62,7 +69,19 @@ struct Config {
 struct App {
     queue: Vec<PathBuf>,
     pos: usize,
-    scan_rx: Receiver<Vec<PathBuf>>,
+    scan_rx: Receiver<loader::Scan>,
+    /// Client mode: the frame-web server the photos come from. Photo paths are then paths on
+    /// the server, and no file on this machine is ever read, moved or deleted.
+    remote: Option<Arc<remote::Remote>>,
+    /// Why the last scan of the photo server failed, and when.
+    scan_error: Option<(String, Instant)>,
+    /// Client mode: the server's folders (for Move), and a refresh of them on its way.
+    folders: Option<remote::Folders>,
+    folders_rx: Option<Receiver<Result<remote::Folders, String>>>,
+    /// Client mode: the photo whose "Choose folder..." list is open, and its search text.
+    folder_list: Option<(PathBuf, String)>,
+    /// Client mode: ask the server for its photo list again (each new round of the slideshow).
+    refresh_remote: bool,
     scanned: bool,
     job_tx: Sender<PathBuf>,
     res_rx: Receiver<Loaded>,
@@ -100,12 +119,22 @@ struct App {
 
 impl App {
     fn new(ctx: &egui::Context, cfg: Config) -> Self {
-        let scan_rx = loader::spawn_scan(ctx.clone(), cfg.dirs.clone(), cfg.settings.exclude.clone());
-        let (job_tx, res_rx) = loader::spawn_workers(ctx.clone());
+        let remote = cfg.settings.server.as_deref().map(|s| Arc::new(remote::Remote::new(s)));
+        let scan_rx = match &remote {
+            Some(r) => loader::spawn_remote_scan(ctx.clone(), r.clone()),
+            None => loader::spawn_scan(ctx.clone(), cfg.dirs.clone(), cfg.settings.exclude.clone()),
+        };
+        let (job_tx, res_rx) = loader::spawn_workers(ctx.clone(), remote.clone());
         Self {
             queue: Vec::new(),
             pos: 0,
             scan_rx,
+            remote,
+            scan_error: None,
+            folders: None,
+            folders_rx: None,
+            folder_list: None,
+            refresh_remote: false,
             scanned: false,
             job_tx,
             res_rx,
@@ -222,11 +251,35 @@ impl App {
                 self.toast = Some((format!("Could not open the folder: {e}"), Instant::now(), false));
             }
         }
-        while let Ok(mut batch) = self.scan_rx.try_recv() {
-            batch.shuffle(&mut rand::rng());
-            self.queue = batch;
-            self.pos = 0;
+        while let Ok(scan) = self.scan_rx.try_recv() {
             self.scanned = true;
+            match scan {
+                Ok(mut batch) => {
+                    batch.shuffle(&mut rand::rng());
+                    // A refresh keeps the photo on screen first, so the slideshow does not jump.
+                    if let Some((p, _)) = &self.shown
+                        && let Some(i) = batch.iter().position(|q| q == p) {
+                            batch.swap(0, i);
+                        }
+                    self.queue = batch;
+                    self.pos = 0;
+                    self.scan_error = None;
+                }
+                Err(e) => {
+                    eprintln!("photo server: {e}");
+                    self.scan_error = Some((e, Instant::now()));
+                }
+            }
+        }
+        if let Some(Ok(res)) = self.folders_rx.as_ref().map(|rx| rx.try_recv()) {
+            self.folders_rx = None;
+            match res {
+                Ok(f) => self.folders = Some(f),
+                Err(e) => self.toast = Some((format!("Could not get the folders: {e}"), Instant::now(), false)),
+            }
+        }
+        if self.scan_error.as_ref().is_some_and(|(_, at)| at.elapsed() >= SERVER_RETRY) {
+            self.rescan(ctx);
         }
         while let Ok(res) = self.res_rx.try_recv() {
             match res {
@@ -286,6 +339,10 @@ impl App {
             self.pos += 1;
             if self.pos >= n {
                 self.pos = 0;
+                // Client mode: photos added or removed elsewhere (the phone) show up from the next round.
+                if self.remote.is_some() {
+                    self.refresh_remote = true;
+                }
                 self.queue.shuffle(&mut rand::rng());
                 // A new round should not start with the photo that is on screen now.
                 if n > 1 && self.shown.as_ref().is_some_and(|(p, _)| *p == self.queue[0]) {
@@ -313,6 +370,19 @@ impl App {
 
     fn delete_current(&mut self) {
         let Some((path, _)) = self.shown.clone() else { return };
+        if let Some(r) = self.remote.clone() {
+            match r.trash(&path) {
+                Ok(msg) => {
+                    self.shown = None;
+                    self.cache.remove(&path);
+                    self.remove_from_queue(&path);
+                    self.last_action = Some(Undo::Remote);
+                    self.toast = Some((msg, Instant::now(), true));
+                }
+                Err(e) => self.toast = Some((format!("Trash failed: {e}"), Instant::now(), false)),
+            }
+            return;
+        }
         let video = live_video(&path);
         let result = match &video {
             Some(v) => trash::delete_all([&path, v]),
@@ -334,11 +404,20 @@ impl App {
     }
 
     fn busy(&self) -> bool {
-        self.move_menu || self.pick.is_some()
+        self.move_menu || self.pick.is_some() || self.folder_list.is_some()
     }
 
     fn undo(&mut self) {
         let msg = match self.last_action.take() {
+            Some(Undo::Remote) => match self.remote.clone().map(|r| r.undo()) {
+                Some(Ok((msg, path))) => {
+                    self.remove_from_queue(&path);
+                    self.reinsert(path);
+                    msg
+                }
+                Some(Err(e)) => format!("Undo failed: {e}"),
+                None => return,
+            },
             Some(Undo::Trashed(path, video)) => self.undo_trash(path, video),
             Some(Undo::Moved { from, to, video }) => {
                 let dest = free_name(&from, video.as_ref().map(|(old, _)| old.as_path()));
@@ -400,6 +479,23 @@ impl App {
     }
 
     fn move_current_to(&mut self, photo: PathBuf, dir: PathBuf) {
+        if let Some(r) = self.remote.clone() {
+            match r.move_to(&photo, &dir) {
+                Ok(msg) => {
+                    self.cache.remove(&photo);
+                    if self.shown.as_ref().is_some_and(|(p, _)| *p == photo) {
+                        self.shown = None;
+                    }
+                    self.remove_from_queue(&photo);
+                    self.last_action = Some(Undo::Remote);
+                    self.toast = Some((msg, Instant::now(), true));
+                    // The server keeps the recent folders; ask again for the new order.
+                    self.fetch_folders();
+                }
+                Err(e) => self.toast = Some((format!("Move failed: {e}"), Instant::now(), false)),
+            }
+            return;
+        }
         let Some(name) = photo.file_name() else { return };
         let target = dir.join(name);
         if target == photo {
@@ -488,8 +584,82 @@ impl App {
     }
 
     fn rescan(&mut self, ctx: &egui::Context) {
-        self.scan_rx = loader::spawn_scan(ctx.clone(), self.dirs.clone(), self.settings.exclude.clone());
-        self.scanned = false;
+        self.scan_rx = match &self.remote {
+            Some(r) => loader::spawn_remote_scan(ctx.clone(), r.clone()),
+            None => loader::spawn_scan(ctx.clone(), self.dirs.clone(), self.settings.exclude.clone()),
+        };
+        // An unreachable server is not asked again until this attempt has answered.
+        self.scan_error = None;
+        if self.queue.is_empty() {
+            self.scanned = false;
+        }
+    }
+
+    /// Client mode: asks the server for its folders in the background (for Move).
+    fn fetch_folders(&mut self) {
+        let Some(r) = self.remote.clone() else { return };
+        if self.folders_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        self.folders_rx = Some(rx);
+        std::thread::spawn(move || {
+            let _ = tx.send(r.folders());
+        });
+    }
+
+    /// A folder's name as shown in menus: its path inside the photo library in client mode.
+    fn folder_label(&self, dir: &Path) -> String {
+        if let Some(f) = &self.folders
+            && let Some(root) = f.roots.iter().find(|r| dir.starts_with(r)) {
+                let rel = dir.strip_prefix(root).unwrap_or(dir).to_string_lossy().into_owned();
+                return if rel.is_empty() { "(photo library)".into() } else { rel };
+            }
+        dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| dir.display().to_string())
+    }
+
+    /// Client mode: "Choose folder..." lists the server's folders, with a search box.
+    fn folder_list_viewport(&mut self, ctx: &egui::Context) {
+        let Some((photo, mut query)) = self.folder_list.clone() else { return };
+        let builder = egui::ViewportBuilder::default()
+            .with_title("Move photo to...")
+            .with_inner_size([380.0, 520.0])
+            .with_min_inner_size([260.0, 240.0]);
+        let names: Vec<(PathBuf, String)> = self
+            .folders
+            .as_ref()
+            .map(|f| f.all.iter().map(|d| (d.clone(), self.folder_label(d))).collect())
+            .unwrap_or_default();
+        let loading = self.folders_rx.is_some() && names.is_empty();
+        let (mut chosen, mut close) = (None::<PathBuf>, false);
+        ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("frame-move-to"), builder, |ctx, _| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.add(egui::TextEdit::singleline(&mut query).hint_text("Search folders").desired_width(f32::INFINITY));
+                ui.add_space(4.0);
+                if loading {
+                    ui.weak("Loading folders...");
+                }
+                let q = query.to_lowercase();
+                egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                    for (dir, name) in names.iter().filter(|(_, n)| q.is_empty() || n.to_lowercase().contains(&q)) {
+                        if ui.add(egui::Button::new(name.as_str()).frame(false)).clicked() {
+                            chosen = Some(dir.clone());
+                        }
+                    }
+                });
+            });
+            if ctx.input(|i| i.viewport().close_requested() || i.key_pressed(egui::Key::Escape)) {
+                close = true;
+            }
+        });
+        if let Some(dir) = chosen {
+            self.folder_list = None;
+            self.move_current_to(photo, dir);
+        } else if close {
+            self.folder_list = None;
+        } else {
+            self.folder_list = Some((photo, query));
+        }
     }
 
     fn save_exclude(&mut self, ctx: &egui::Context) {
@@ -508,7 +678,11 @@ impl App {
             self.move_menu = false;
             return;
         };
-        let recents: Vec<PathBuf> = self.settings.recent.iter().filter(|p| p.is_dir()).take(4).cloned().collect();
+        let recents: Vec<PathBuf> = match (&self.remote, &self.folders) {
+            (Some(_), Some(f)) => f.recent.iter().take(4).cloned().collect(),
+            (Some(_), None) => Vec::new(),
+            (None, _) => self.settings.recent.iter().filter(|p| p.is_dir()).take(4).cloned().collect(),
+        };
         let (row_h, head_h) = (28.0, 26.0);
         let w = 230.0_f32.min(bounds.width() - 20.0);
         let h = head_h + row_h * (recents.len() as f32 + 1.0) + 8.0;
@@ -544,11 +718,8 @@ impl App {
             );
             resp.clicked()
         };
-        for (i, dir) in recents.iter().enumerate() {
-            let name = dir
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| dir.display().to_string());
+        let names: Vec<String> = recents.iter().map(|d| self.folder_label(d)).collect();
+        for (i, (dir, name)) in recents.iter().zip(names).enumerate() {
             if row(ui, Id::new(("move-row", i)), name, y) {
                 chosen = Some(dir.clone());
             }
@@ -565,7 +736,12 @@ impl App {
             self.move_current_to(photo, dir);
         } else if browse {
             self.move_menu = false;
-            self.start_pick(ctx, Pick::MoveTo(photo));
+            if self.remote.is_some() {
+                self.fetch_folders();
+                self.folder_list = Some((photo, String::new()));
+            } else {
+                self.start_pick(ctx, Pick::MoveTo(photo));
+            }
         } else if clicked_outside {
             self.move_menu = false;
         }
@@ -609,12 +785,18 @@ impl App {
             .with_min_inner_size([380.0, 320.0]);
         let dirs = self.dirs.clone();
         let exclude = self.settings.exclude.clone();
+        let server = self.remote.as_ref().map(|r| r.base().to_string());
         let mut secs = self.interval.as_secs();
         let mut fit = self.fit;
         let (mut close, mut add, mut remove) = (false, false, None::<usize>);
         let (mut add_exclude, mut unexclude) = (false, None::<usize>);
         ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("frame-settings"), builder, |ctx, _| {
             egui::CentralPanel::default().show(ctx, |ui| {
+                if let Some(server) = &server {
+                    ui.heading("Photo server");
+                    ui.label(format!("Photos come from {server}."));
+                    ui.label("Its own settings decide the photo folders. Remove the server= line from the settings file to show local folders again.");
+                } else {
                 ui.heading("Photo folders");
                 ui.label("Photos are picked at random from these folders and everything inside them.");
                 ui.add_space(6.0);
@@ -648,6 +830,7 @@ impl App {
                 ui.add_space(4.0);
                 if ui.button("Exclude folder...").clicked() {
                     add_exclude = true;
+                }
                 }
                 ui.separator();
                 ui.horizontal(|ui| {
@@ -849,8 +1032,11 @@ impl eframe::App for App {
                 );
             }
             None => {
-                let msg = if !self.scanned {
-                    "Scanning photos..."
+                let unreachable = self.scan_error.as_ref().map(|(e, _)| format!("Can't reach the photo server\n\n{e}"));
+                let msg = if let Some(m) = unreachable.as_deref() {
+                    m
+                } else if !self.scanned {
+                    if self.remote.is_some() { "Loading photos from the server..." } else { "Scanning photos..." }
                 } else if self.queue.is_empty() && self.heif_warned {
                     "No photos found\n\nHEIC photos need the HEIF and HEVC\nextensions from the Microsoft Store"
                 } else if self.queue.is_empty() {
@@ -900,7 +1086,7 @@ impl eframe::App for App {
                 self.paused = !self.paused;
                 ui.close();
             }
-            if ui.add_enabled(self.shown.is_some(), egui::Button::new("Show in folder")).clicked() {
+            if self.remote.is_none() && ui.add_enabled(self.shown.is_some(), egui::Button::new("Show in folder")).clicked() {
                 self.show_current_in_folder(&ctx);
                 ui.close();
             }
@@ -986,11 +1172,16 @@ impl eframe::App for App {
             }
             if mv_resp.clicked() {
                 self.move_menu = !self.move_menu;
+                if self.move_menu {
+                    self.fetch_folders();
+                }
             }
             if self.move_menu {
                 self.draw_move_menu(ui, &ctx, &painter, mv, rect);
             }
             // "Show in folder" button (bottom-right): reveal the photo in the file manager.
+            // Not in client mode: the photo is on another machine.
+            if self.remote.is_none() {
             let folder = Rect::from_min_size(overlay.right_bottom() + vec2(-122.0, -36.0), vec2(114.0, 28.0));
             let folder_resp = ui.interact(folder, Id::new("show-in-folder"), Sense::click());
             let folder_fill = if folder_resp.hovered() {
@@ -1005,6 +1196,7 @@ impl eframe::App for App {
             }
             if folder_resp.clicked() {
                 self.show_current_in_folder(&ctx);
+            }
             }
         }
 
@@ -1039,7 +1231,11 @@ impl eframe::App for App {
         }
 
         self.settings_viewport(&ctx);
+        self.folder_list_viewport(&ctx);
         self.track_geometry(&ctx);
+        if std::mem::take(&mut self.refresh_remote) {
+            self.rescan(&ctx);
+        }
 
         // Draw again only when something is due (input, loading and dialogs wake the window
         // themselves), instead of redrawing twice a second forever.
@@ -1058,6 +1254,12 @@ impl eframe::App for App {
         }
         if !self.paused && !self.busy() && !self.hover_photo && showing_current && self.queue.len() > 1 {
             next = next.min(self.interval.saturating_sub(self.shown_at.elapsed()) + Duration::from_millis(20));
+        }
+        if let Some((_, at)) = &self.scan_error {
+            next = next.min(SERVER_RETRY.saturating_sub(at.elapsed()) + Duration::from_millis(50));
+        }
+        if self.folders_rx.is_some() || self.folder_list.is_some() {
+            next = next.min(Duration::from_millis(200));
         }
         if let Some((_, since)) = self.geometry_changed {
             next = next.min(GEOMETRY_SAVE_DELAY.saturating_sub(since.elapsed()) + Duration::from_millis(50));

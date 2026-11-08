@@ -8,6 +8,8 @@ use std::thread;
 use eframe::egui::{self, ColorImage};
 use image::ImageDecoder;
 
+use crate::remote::Remote;
+
 /// Longest side photos are shrunk to before they become textures.
 const MAX_SIDE: u32 = 2048;
 const WORKERS: usize = 2;
@@ -25,6 +27,9 @@ fn is_photo_ext(ext: &str) -> bool {
     EXTS.contains(&ext) || (HAS_HEIF && HEIF_EXTS.contains(&ext))
 }
 
+/// What a scan sends back: the photos found, or why the photo server could not be reached.
+pub type Scan = Result<Vec<PathBuf>, String>;
+
 pub enum Loaded {
     Ok(PathBuf, ColorImage),
     Err(PathBuf, String),
@@ -32,10 +37,20 @@ pub enum Loaded {
 
 /// Scans the folders on a background thread and sends back every photo found,
 /// leaving out anything inside an `exclude` folder.
-pub fn spawn_scan(ctx: egui::Context, dirs: Vec<PathBuf>, exclude: Vec<PathBuf>) -> Receiver<Vec<PathBuf>> {
+pub fn spawn_scan(ctx: egui::Context, dirs: Vec<PathBuf>, exclude: Vec<PathBuf>) -> Receiver<Scan> {
     let (scan_tx, scan_rx) = mpsc::channel();
     thread::spawn(move || {
-        let _ = scan_tx.send(collect(&dirs, &exclude));
+        let _ = scan_tx.send(Ok(collect(&dirs, &exclude)));
+        ctx.request_repaint();
+    });
+    scan_rx
+}
+
+/// Asks the photo server for its photo list on a background thread (client mode).
+pub fn spawn_remote_scan(ctx: egui::Context, remote: Arc<Remote>) -> Receiver<Scan> {
+    let (scan_tx, scan_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = scan_tx.send(remote.list());
         ctx.request_repaint();
     });
     scan_rx
@@ -80,8 +95,9 @@ impl Exclude {
     }
 }
 
-/// Starts the decoder threads. Returns (job sender, decoded images).
-pub fn spawn_workers(ctx: egui::Context) -> (Sender<PathBuf>, Receiver<Loaded>) {
+/// Starts the decoder threads, which read local files or, in client mode, fetch previews from
+/// the photo server. Returns (job sender, decoded images).
+pub fn spawn_workers(ctx: egui::Context, remote: Option<Arc<Remote>>) -> (Sender<PathBuf>, Receiver<Loaded>) {
     let (job_tx, job_rx) = mpsc::channel::<PathBuf>();
     let (res_tx, res_rx) = mpsc::channel();
     let job_rx = Arc::new(Mutex::new(job_rx));
@@ -89,11 +105,16 @@ pub fn spawn_workers(ctx: egui::Context) -> (Sender<PathBuf>, Receiver<Loaded>) 
         let job_rx = Arc::clone(&job_rx);
         let res_tx = res_tx.clone();
         let ctx = ctx.clone();
+        let remote = remote.clone();
         thread::spawn(move || {
             loop {
                 let job = job_rx.lock().ok().and_then(|rx| rx.recv().ok());
                 let Some(path) = job else { break };
-                let msg = match decode(&path) {
+                let decoded = match &remote {
+                    Some(r) => decode_remote(r, &path),
+                    None => decode(&path),
+                };
+                let msg = match decoded {
                     Ok(img) => Loaded::Ok(path, img),
                     Err(e) => Loaded::Err(path, e),
                 };
@@ -141,6 +162,15 @@ fn decode(path: &Path) -> Result<ColorImage, String> {
     } else {
         img
     };
+    let rgba = img.to_rgba8();
+    let size = [rgba.width() as usize, rgba.height() as usize];
+    Ok(ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()))
+}
+
+fn decode_remote(remote: &Remote, path: &Path) -> Result<ColorImage, String> {
+    let bytes = remote.image(path)?;
+    // The server's previews are JPEGs already turned the right way up and no bigger than needed.
+    let img = image::load_from_memory(&bytes).map_err(|e| e.to_string())?;
     let rgba = img.to_rgba8();
     let size = [rgba.width() as usize, rgba.height() as usize];
     Ok(ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()))

@@ -15,11 +15,13 @@ pub struct Settings {
     pub fit: bool,
     /// Window position and size (x, y, width, height) when it was last moved or resized.
     pub window: Option<[f32; 4]>,
+    /// A frame-web server to show photos from instead of local folders (client mode).
+    pub server: Option<String>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { dirs: Vec::new(), exclude: Vec::new(), recent: Vec::new(), interval: 10, fit: true, window: None }
+        Self { dirs: Vec::new(), exclude: Vec::new(), recent: Vec::new(), interval: 10, fit: true, window: None, server: None }
     }
 }
 
@@ -50,6 +52,7 @@ pub fn load() -> Settings {
                 }
             }
             "fit" => st.fit = value.trim() != "0",
+            "server" if !value.trim().is_empty() => st.server = Some(value.trim().to_string()),
             "window" => {
                 let v: Vec<f32> = value.split(',').filter_map(|n| n.trim().parse().ok()).collect();
                 if let [x, y, w, h] = v[..] {
@@ -75,6 +78,9 @@ pub fn save(st: &Settings) {
         out.push_str(&format!("recent={}\n", d.display()));
     }
     out.push_str(&format!("interval={}\nfit={}\n", st.interval, u8::from(st.fit)));
+    if let Some(server) = &st.server {
+        out.push_str(&format!("server={server}\n"));
+    }
     if let Some([x, y, w, h]) = st.window {
         out.push_str(&format!("window={x:.0},{y:.0},{w:.0},{h:.0}\n"));
     }

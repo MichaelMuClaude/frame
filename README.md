@@ -40,6 +40,18 @@ frame [--interval SECONDS] [--normal] [FOLDER...]
 
 With no folders it uses the ones from Settings, or `~/Pictures` the first time.
 
+### Client mode
+
+With a `server=` line in the settings file, for example
+`server=https://photos.example.ts.net:12443`, frame shows the photos of a
+frame-web server (a small companion web app for looking through photos on a phone, not published yet) instead of local
+folders: it asks the server for the photo list and for 2400-pixel previews, and Trash, Move and
+Undo are done by the server, so no file on this computer is read or changed. The server's own
+settings decide the folders; "Choose folder..." lists the server's folders, and Show in folder is
+hidden. If the server can't be reached the frame says so and tries again every 30 seconds. The
+photo list is fetched again at the start of each round, so photos added or removed elsewhere show
+up then. Remove the line to go back to local folders.
+
 ## Building
 
 You need a recent Rust toolchain and the libheif development files (version 1.17 or newer).
